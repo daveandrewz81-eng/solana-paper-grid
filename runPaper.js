@@ -50,12 +50,15 @@ async function main() {
 
     console.log(new Date().toISOString(), "SOL price:", smoothPrice.toFixed(2));
   } catch (err) {
-    console.log(
-      new Date().toISOString(),
-      "PRICE FETCH FAILED:",
-      err?.code || err?.message || err
-    );
-  }
+  console.log(
+    new Date().toISOString(),
+    "PRICE FETCH FAILED:",
+    err?.code,
+    err?.message,
+    "status:", err?.response?.status,
+    "data:", err?.response?.data
+  );
+}
 
   await new Promise((r) => setTimeout(r, POLL_MS));
 }
