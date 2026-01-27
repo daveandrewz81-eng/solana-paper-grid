@@ -64,11 +64,28 @@ async function main() {
 }
 }
 async function getMidPrice() {
-const res = await axios.get(
-  "https://api.coingecko.com/api/v3/simple/price",
-  { params: { ids: "solana", vs_currencies: "usd" } }
-);
-  return res.data.solana.usd;
+  const inputMint = "So11111111111111111111111111111111111111112"; // SOL
+  const outputMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
+  const amount = 1_000_000_000; // 1 SOL
+
+  const url =
+    `https://quote-api.jup.ag/v6/quote` +
+    `?inputMint=${inputMint}` +
+    `&outputMint=${outputMint}` +
+    `&amount=${amount}` +
+    `&swapMode=ExactIn` +
+    `&slippageBps=50`;
+
+  const res = await axios.get(url, { timeout: 10_000 });
+
+  const route = res.data?.data?.[0];
+const outAmount = Number(route?.outAmount);
+
+if (!outAmount || !Number.isFinite(outAmount)) {
+  throw new Error("No outAmount from Jupiter");
+}
+
+  return outAmount / 1_000_000; // USDC per 1 SOL
 }
 
 main().catch(console.error);
