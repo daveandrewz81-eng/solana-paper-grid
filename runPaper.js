@@ -76,7 +76,12 @@ async function getMidPrice() {
     `&swapMode=ExactIn` +
     `&slippageBps=50`;
 
-  const res = await axios.get(url, { timeout: 10_000 });
+const res = await axios.get(url, {
+  timeout: 10_000,
+  headers: {
+    "User-Agent": "paper-bot"
+  }
+});  
 
   const route = res.data?.data?.[0];
 const outAmount = Number(route?.outAmount);
