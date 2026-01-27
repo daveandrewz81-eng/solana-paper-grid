@@ -17,7 +17,7 @@ dns.setDefaultResultOrder("ipv4first");
 
 console.log("BOOTED OK");
 // ---------------- CONFIG ----------------
-const POLL_MS = Number(process.env.POLL_MS ?? 60000);
+const POLL_MS = Number(process.env.POLL_MS ?? 120000);
 const START_USDC = Number(process.env.START_USDC ?? 50);
 const START_SOL_USDC_WORTH = Number(process.env.START_SOL_USDC_WORTH ?? 50);
 
