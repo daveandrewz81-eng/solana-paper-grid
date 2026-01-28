@@ -2,7 +2,7 @@ import axios from "axios";
 import http from "http";
 import dns from "dns";
 
-console.log("BOOTED OK - Free tier price bot with heartbeat");
+console.log("BOOTED OK - Mobile-friendly price logs");
 
 // ---------------- DNS hardening ----------------
 try {
@@ -10,7 +10,7 @@ try {
   dns.setDefaultResultOrder("ipv4first");
 } catch (_) {}
 
-// ---------------- Tiny HTTP server (keeps Render alive) ----------------
+// ---------------- Tiny HTTP server ----------------
 const PORT = process.env.PORT || 10000;
 
 http
@@ -24,7 +24,7 @@ http
 
 // ---------------- Config ----------------
 const TIMEOUT_MS = 15000;
-const INTERVAL_MS = 30_000; // 30 seconds for testing
+const INTERVAL_MS = 30_000;
 
 // ---------------- Price sources ----------------
 async function priceFromCoinbase() {
@@ -33,51 +33,15 @@ async function priceFromCoinbase() {
     { timeout: TIMEOUT_MS }
   );
   const price = Number(res?.data?.data?.amount);
-  if (!Number.isFinite(price)) throw new Error("Coinbase: bad price");
+  if (!Number.isFinite(price)) throw new Error("Coinbase bad price");
   return { source: "coinbase", price };
 }
 
-async function priceFromKraken() {
-  const res = await axios.get(
-    "https://api.kraken.com/0/public/Ticker?pair=SOLUSD",
-    { timeout: TIMEOUT_MS }
-  );
-  const obj = res?.data?.result;
-  const firstKey = obj && Object.keys(obj)[0];
-  const price = Number(firstKey ? obj[firstKey]?.c?.[0] : NaN);
-  if (!Number.isFinite(price)) throw new Error("Kraken: bad price");
-  return { source: "kraken", price };
-}
-
-async function priceFromCoinGecko() {
-  const res = await axios.get(
-    "https://api.coingecko.com/api/v3/simple/price",
-    {
-      timeout: TIMEOUT_MS,
-      params: { ids: "solana", vs_currencies: "usd" },
-      headers: { "User-Agent": "render-sol-price-bot" },
-    }
-  );
-  const price = Number(res?.data?.solana?.usd);
-  if (!Number.isFinite(price)) throw new Error("CoinGecko: bad price");
-  return { source: "coingecko", price };
-}
-
 async function getSolUsdPrice() {
-  const fns = [priceFromCoinbase, priceFromKraken, priceFromCoinGecko];
-  let lastErr;
-
-  for (const fn of fns) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-  throw lastErr || new Error("All sources failed");
+  return priceFromCoinbase(); // primary only to keep logs clean
 }
 
-// ---------------- Main tick loop ----------------
+// ---------------- Tick ----------------
 async function tick() {
   try {
     const { source, price } = await getSolUsdPrice();
@@ -85,16 +49,10 @@ async function tick() {
     globalThis.__tick = (globalThis.__tick || 0) + 1;
 
     console.log(
-      new Date().toISOString(),
-      `TICK #${globalThis.__tick} | SOL/USD (${source}):`,
-      price.toFixed(2)
+      `PRICE ${price.toFixed(2)} | TICK ${globalThis.__tick} | ${source}`
     );
   } catch (err) {
-    console.error(
-      new Date().toISOString(),
-      "PRICE_FETCH_FAILED",
-      err?.message || err
-    );
+    console.error("PRICE_FETCH_FAILED", err?.message || err);
   }
 }
 
