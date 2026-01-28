@@ -13,9 +13,10 @@ http.createServer((req, res) => {
   console.log(new Date().toISOString(), `HTTP server listening on ${PORT}`);
 });
 
-console.log("BOOTED OK");
 // ---------------- CONFIG ----------------
-const POLL_MS = Number(process.env.POLL_MS ?? 15000);
+
+const POLL_MS = Number(process.env.POLL_MS || 60000); // 60 seconds
+console.log("BOOTED OK", { POLL_MS });
 const START_USDC = Number(process.env.START_USDC ?? 50);
 const START_SOL_USDC_WORTH = Number(process.env.START_SOL_USDC_WORTH ?? 50);
 
@@ -23,6 +24,8 @@ const USDC_MINT = process.env.INPUT_MINT_USDC;
 const SOL_MINT = process.env.OUTPUT_MINT_SOL;
 
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 50);
+
+
 
 // ---------------------------------------
 
