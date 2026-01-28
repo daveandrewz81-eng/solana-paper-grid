@@ -2,23 +2,15 @@ import axios from "axios";
 import http from "http";
 import dns from "dns";
 
-console.log("BOOTED OK - Multi-source SOL price bot (DNS hardened)");
+console.log("BOOTED OK - Free tier price bot with heartbeat");
 
-// --------------------------------------------------
-// Force DNS to known-good servers (fixes ENOTFOUND on some hosts)
-// --------------------------------------------------
+// ---------------- DNS hardening ----------------
 try {
-  dns.setServers(["1.1.1.1", "8.8.8.8", "9.9.9.9"]);
-} catch (_) {}
-
-try {
-  // Prefer IPv4 where supported (Node 16+)
+  dns.setServers(["1.1.1.1", "8.8.8.8"]);
   dns.setDefaultResultOrder("ipv4first");
 } catch (_) {}
 
-// --------------------------------------------------
-// Tiny HTTP server so Render Web Service stays alive
-// --------------------------------------------------
+// ---------------- Tiny HTTP server (keeps Render alive) ----------------
 const PORT = process.env.PORT || 10000;
 
 http
@@ -30,23 +22,26 @@ http
     console.log(new Date().toISOString(), `HTTP server listening on ${PORT}`);
   });
 
-// --------------------------------------------------
-// Price sources (no API keys)
-// --------------------------------------------------
+// ---------------- Config ----------------
 const TIMEOUT_MS = 15000;
-const INTERVAL_MS = 30_000;
+const INTERVAL_MS = 30_000; // 30 seconds for testing
 
+// ---------------- Price sources ----------------
 async function priceFromCoinbase() {
-  const url = "https://api.coinbase.com/v2/prices/SOL-USD/spot";
-  const res = await axios.get(url, { timeout: TIMEOUT_MS });
+  const res = await axios.get(
+    "https://api.coinbase.com/v2/prices/SOL-USD/spot",
+    { timeout: TIMEOUT_MS }
+  );
   const price = Number(res?.data?.data?.amount);
   if (!Number.isFinite(price)) throw new Error("Coinbase: bad price");
   return { source: "coinbase", price };
 }
 
 async function priceFromKraken() {
-  const url = "https://api.kraken.com/0/public/Ticker?pair=SOLUSD";
-  const res = await axios.get(url, { timeout: TIMEOUT_MS });
+  const res = await axios.get(
+    "https://api.kraken.com/0/public/Ticker?pair=SOLUSD",
+    { timeout: TIMEOUT_MS }
+  );
   const obj = res?.data?.result;
   const firstKey = obj && Object.keys(obj)[0];
   const price = Number(firstKey ? obj[firstKey]?.c?.[0] : NaN);
@@ -55,12 +50,14 @@ async function priceFromKraken() {
 }
 
 async function priceFromCoinGecko() {
-  const url = "https://api.coingecko.com/api/v3/simple/price";
-  const res = await axios.get(url, {
-    timeout: TIMEOUT_MS,
-    params: { ids: "solana", vs_currencies: "usd" },
-    headers: { "User-Agent": "render-sol-price-bot" },
-  });
+  const res = await axios.get(
+    "https://api.coingecko.com/api/v3/simple/price",
+    {
+      timeout: TIMEOUT_MS,
+      params: { ids: "solana", vs_currencies: "usd" },
+      headers: { "User-Agent": "render-sol-price-bot" },
+    }
+  );
   const price = Number(res?.data?.solana?.usd);
   if (!Number.isFinite(price)) throw new Error("CoinGecko: bad price");
   return { source: "coingecko", price };
@@ -73,28 +70,34 @@ async function getSolUsdPrice() {
   for (const fn of fns) {
     try {
       return await fn();
-    } catch (e) {
-      lastErr = e;
+    } catch (err) {
+      lastErr = err;
     }
   }
   throw lastErr || new Error("All sources failed");
 }
 
+// ---------------- Main tick loop ----------------
 async function tick() {
   try {
     const { source, price } = await getSolUsdPrice();
-    console.log(new Date().toISOString(), `SOL/USD (${source}):`, price.toFixed(2));
+
+    globalThis.__tick = (globalThis.__tick || 0) + 1;
+
+    console.log(
+      new Date().toISOString(),
+      `TICK #${globalThis.__tick} | SOL/USD (${source}):`,
+      price.toFixed(2)
+    );
   } catch (err) {
-    // Print FULL details so we stop guessing
-    const info = {
-      message: err?.message,
-      code: err?.code,
-      hostname: err?.hostname,
-      syscall: err?.syscall,
-    };
-    console.error(new Date().toISOString(), "PRICE_FETCH_FAILED", JSON.stringify(info));
+    console.error(
+      new Date().toISOString(),
+      "PRICE_FETCH_FAILED",
+      err?.message || err
+    );
   }
 }
 
+// ---------------- Start ----------------
 tick();
 setInterval(tick, INTERVAL_MS);
