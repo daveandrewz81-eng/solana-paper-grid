@@ -12,8 +12,6 @@ http.createServer((req, res) => {
 }).listen(PORT, () => {
   console.log(new Date().toISOString(), `HTTP server listening on ${PORT}`);
 });
-dns.setServers(["1.1.1.1", "1.0.0.1"]); // Cloudflare DNS
-dns.setDefaultResultOrder("ipv4first");
 
 console.log("BOOTED OK");
 // ---------------- CONFIG ----------------
@@ -68,7 +66,8 @@ async function getMidPrice() {
   const amount = 1_000_000_000; // 1 SOL (lamports)
 
   const url =
-    `https://quote-api.jup.ag/v6/quote` +
+    `  const url =
+'https://api.jup.ag/swap/v1/quote' +
     `?inputMint=${inputMint}` +
     `&outputMint=${outputMint}` +
     `&amount=${amount}` +
