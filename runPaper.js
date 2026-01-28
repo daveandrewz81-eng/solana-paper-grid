@@ -17,7 +17,7 @@ dns.setDefaultResultOrder("ipv4first");
 
 console.log("BOOTED OK");
 // ---------------- CONFIG ----------------
-const POLL_MS = Number(process.env.POLL_MS ?? 120000);
+const POLL_MS = Number(process.env.POLL_MS ?? 3000);
 const START_USDC = Number(process.env.START_USDC ?? 50);
 const START_SOL_USDC_WORTH = Number(process.env.START_SOL_USDC_WORTH ?? 50);
 
@@ -50,14 +50,13 @@ async function main() {
 
     console.log(new Date().toISOString(), "SOL price:", smoothPrice.toFixed(2));
   } catch (err) {
+  const status = err?.response?.status;
+  const data = err?.response?.data;
+  const msg = err?.message || err?.code || String(err);
+
   console.log(
-    new Date().toISOString(),
-    "PRICE FETCH FAILED:",
-    err?.code,
-    err?.message,
-    "status:", err?.response?.status,
-    "data:", err?.response?.data
-  );
+  `${new Date().toISOString()} PRICE_FETCH_FAILED msg=${msg} status=${status} data=${JSON.stringify(data)?.slice(0,200)}`
+);
 }
 
   await new Promise((r) => setTimeout(r, POLL_MS));
