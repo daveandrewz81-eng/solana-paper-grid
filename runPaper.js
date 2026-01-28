@@ -66,7 +66,7 @@ async function main() {
 async function getMidPrice() {
   const inputMint = "So11111111111111111111111111111111111111112"; // SOL
   const outputMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
-  const amount = 1_000_000_000; // 1 SOL
+  const amount = 1_000_000_000; // 1 SOL (lamports)
 
   const url =
     `https://quote-api.jup.ag/v6/quote` +
@@ -76,21 +76,19 @@ async function getMidPrice() {
     `&swapMode=ExactIn` +
     `&slippageBps=50`;
 
-const res = await axios.get(url, {
-  timeout: 10_000,
-  headers: {
-    "User-Agent": "paper-bot"
-  }
-});  
+  const res = await axios.get(url, {
+    timeout: 10_000,
+    headers: { "User-Agent": "paper-bot", "Accept": "application/json" },
+  });
 
-  const route = res.data?.data?.[0];
-const outAmount = Number(route?.outAmount);
+const outAmountRaw = res.data?.outAmount; // Jupiter v6
+const outAmount = Number(outAmountRaw);
 
-if (!outAmount || !Number.isFinite(outAmount)) {
+if (!outAmountRaw || !Number.isFinite(outAmount)) {
   throw new Error("No outAmount from Jupiter");
 }
 
-  return outAmount / 1_000_000; // USDC per 1 SOL
-}
+return outAmount / 1_000_000; // USDC per 1 SOL
+
 
 main().catch(console.error);
