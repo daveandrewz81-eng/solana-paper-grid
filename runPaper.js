@@ -80,11 +80,11 @@ async function getMidPrice() {
     headers: { "User-Agent": "paper-bot", "Accept": "application/json" },
   });
 
-const outAmountRaw = res.data?.outAmount; // Jupiter v6
-const outAmount = Number(outAmountRaw);
+const route = res.data?.data?.[0];
+const outAmount = Number(route?.outAmount);
 
-if (!outAmountRaw || !Number.isFinite(outAmount)) {
-  throw new Error("No outAmount from Jupiter");
+if (!outAmount || !Number.isFinite(outAmount)) {
+  throw new Error("No outAmount from Jupiter v6");
 }
 
 return outAmount / 1_000_000; // USDC per 1 SOL
