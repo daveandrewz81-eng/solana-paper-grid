@@ -89,6 +89,6 @@ if (!outAmountRaw || !Number.isFinite(outAmount)) {
 }
 
 return outAmount / 1_000_000; // USDC per 1 SOL
-
+} 
 
 main().catch(console.error);
