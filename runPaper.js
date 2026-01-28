@@ -51,12 +51,13 @@ async function main() {
 
     console.log(new Date().toISOString(), "SOL price:", smoothPrice.toFixed(2));
   } catch (err) {
-  const status = err?.response?.status;
-  const data = err?.response?.data;
-  const msg = err?.message || err?.code || String(err);
+  const status = err && err.response ? err.response.status : undefined;
+const data = err && err.response ? err.response.data : undefined;
+const msg = err?.message || err?.code || String(err);
 
-  console.log(
-  `${new Date().toISOString()} PRICE_FETCH_FAILED msg=${msg} status=${status} data=${JSON.stringify(data)?.slice(0,200)}`
+const safeData = data ? JSON.stringify(data).slice(0, 200) : "null";
+console.log(
+  `${new Date().toISOString()} PRICE_FETCH_FAILED msg=${msg} status=${status} data=${safeData}`
 );
 }
 
