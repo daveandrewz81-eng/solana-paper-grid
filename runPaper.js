@@ -1,103 +1,45 @@
-
-import "dotenv/config";
 import axios from "axios";
-import dns from "node:dns"
-import http from "node:http";
 
-const PORT = process.env.PORT
+console.log("BOOTED OK - Paper price bot running");
 
-http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("ok\n");
-}).listen(PORT, () => {
-  console.log(new Date().toISOString(), `HTTP server listening on ${PORT}`);
-});
+// SOL → USDC mints
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-// ---------------- CONFIG ----------------
+// 1 SOL in lamports
+const ONE_SOL = 1_000_000_000;
 
-const POLL_MS = Number(process.env.POLL_MS || 60000); // 60 seconds
-console.log("BOOTED OK", { POLL_MS });
-const START_USDC = Number(process.env.START_USDC ?? 50);
-const START_SOL_USDC_WORTH = Number(process.env.START_SOL_USDC_WORTH ?? 50);
-
-const USDC_MINT = process.env.INPUT_MINT_USDC;
-const SOL_MINT = process.env.OUTPUT_MINT_SOL;
-
-const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? 50);
-
-
-
-// ---------------------------------------
-
-const USDC_DEC = 1e6;
-const SOL_DEC = 1e9;
-
-let usdc = START_USDC;
-let sol = 0;
-let lastPrice = null;
-let priceBuffer = [];
-async function main() {
-  console.log("Paper bot started");
-  while (true) {
+// fetch price once
+async function fetchSolPrice() {
   try {
-    const price = await getMidPrice();
+    const url =
+      "https://quote-api.jup.ag/v6/quote" +
+      `?inputMint=${SOL_MINT}` +
+      `&outputMint=${USDC_MINT}` +
+      `&amount=${ONE_SOL}` +
+      "&slippageBps=50";
 
-    // --- PRICE SMOOTHER (3-point moving average) ---
-    priceBuffer.push(price);
-    if (priceBuffer.length > 3) priceBuffer.shift();
+    const res = await axios.get(url, { timeout: 15000 });
 
-    const smoothPrice =
-      priceBuffer.reduce((a, b) => a + b, 0) / priceBuffer.length;
+    const outAmount = res.data.outAmount;
+    const price = Number(outAmount) / 1_000_000;
 
-    console.log(new Date().toISOString(), "SOL price:", smoothPrice.toFixed(2));
+    console.log(
+      new Date().toISOString(),
+      "SOL/USDC:",
+      price.toFixed(2)
+    );
   } catch (err) {
-  const status = err && err.response ? err.response.status : undefined;
-const data = err && err.response ? err.response.data : undefined;
-const msg = err?.message || err?.code || String(err);
-
-const safeData = data ? JSON.stringify(data).slice(0, 200) : "null";
-console.log(
-  `${new Date().toISOString()} PRICE_FETCH_FAILED msg=${msg} status=${status} data=${safeData}`
-);
+    console.error(
+      new Date().toISOString(),
+      "PRICE_FETCH_FAILED",
+      err?.message || err
+    );
+  }
 }
 
-  await new Promise((r) => setTimeout(r, POLL_MS));
-}
-}
-async function getMidPrice() {
-  const inputMint = "So11111111111111111111111111111111111111112"; // SOL
-  const outputMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
-  const amount = 1_000_000_000; // 1 SOL (lamports)
+// run immediately
+fetchSolPrice();
 
-  const url =
-    `  const url =
-'https://api.jup.ag/swap/v1/quote' +
-    `?inputMint=${inputMint}` +
-    `&outputMint=${outputMint}` +
-    `&amount=${amount}` +
-    `&swapMode=ExactIn` +
-    `&slippageBps=50`;
-
-  const res = await axios.get(url, {
-    timeout: 10_000,
-    headers: { "User-Agent": "paper-bot", "Accept": "application/json" },
-  });
-
- const route = res.data?.data?.[0];
-  
-const outAmountStr = route?.outAmount;
-
-if (!outAmountStr) {
-  throw new Error("No outAmount from Jupiter v6");
-}
-
-const outAmount = Number(outAmountStr);
-
-if (!Number.isFinite(outAmount)) {
-  throw new Error("Invalid outAmount from Jupiter v6");
-} 
-
-return outAmount / 1_000_000; // USDC per 1 SOL
-} 
-
-main().catch(console.error);
+// repeat every 60 seconds
+setInterval(fetchSolPrice, 60_000);
