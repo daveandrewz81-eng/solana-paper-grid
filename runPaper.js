@@ -34,7 +34,7 @@ http
 // Price sources (no API keys)
 // --------------------------------------------------
 const TIMEOUT_MS = 15000;
-const INTERVAL_MS = 60_000;
+const INTERVAL_MS = 30_000;
 
 async function priceFromCoinbase() {
   const url = "https://api.coinbase.com/v2/prices/SOL-USD/spot";
