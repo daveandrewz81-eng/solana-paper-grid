@@ -1,16 +1,16 @@
 /**
- * runPaper.js — DARK LADDER UI + % GRID (ASYMMETRIC) + MORE RELIABLE PRICE
- * ----------------------------------------------------------------------
- * This is a full rewrite of the script you tried, BUT with the key fix:
- * ✅ Price fetching is hardened for Render (CG first + Binance fallback + JUP + optional Birdeye)
- * ✅ Longer timeouts + retry/backoff so it actually boots and sets Anchor/NOW
+ * runPaper.js — DARK LADDER UI + % GRID (ASYMMETRIC) + RELIABLE PRICE (NO JUP)
+ * --------------------------------------------------------------------------
+ * Fix: Removes Jupiter entirely (Render DNS keeps failing: ENOTFOUND quote-api.jup.ag)
+ * Price sources (in order): BINANCE -> COINGECKO -> KRAKEN -> (optional) BIRDEYE
  *
- * Strategy changes you asked for:
- * ✅ #1 Percent spacing (not $0.50)
- * ✅ #2 Asymmetric spacing (buys wider, sells tighter)
+ * Strategy:
+ *   ✅ Percent spacing
+ *   ✅ Asymmetric steps (buys wider, sells tighter)
+ *   ✅ Packets + guard
  *
  * UI:
- * ✅ Dark ladder layout (guard/packets + NOW + last trades + ladder)
+ *   ✅ Same dark ladder layout (guard/packets + NOW + last trades + ladder)
  *
  * Run:
  *   node runPaper.js
@@ -30,61 +30,49 @@ import fs from "fs";
 // =====================
 // CONFIG
 // =====================
-const TIMEOUT_MS = 25_000;          // was 15s; Render often needs longer
+const TIMEOUT_MS = 25_000;
 const TICK_MS = 30_000;
 const UI_REFRESH_HINT_MS = 3000;
 
-// Packets (capacity)
 const BUY_PACKETS = 6;
 const SELL_PACKETS = 6;
 
-// Ladder depth shown
 const LEVELS_EACH_SIDE = 10;
 
-// ✅ Your chosen improvements
+// Your chosen improvements
 const BUY_STEP_PCT = 0.008;   // 0.8% between buy rungs (wider)
 const SELL_STEP_PCT = 0.006;  // 0.6% between sell rungs (tighter)
 
-// Order sizing (paper)
 const ORDER_NOTIONAL_USD = 25;
 
-// Starting balances
 const START_USD = 1000;
 const START_SOL = 0;
 
-// Sim slippage (paper)
 const SIM_SLIPPAGE_PCT = 0.0;
 
-// Web server
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
-// Persistence
 const STATE_FILE = "./paper_state_dark.json";
 
 // =====================
-// PRICE SOURCES
+// PRICE SOURCES (NO JUP)
 // =====================
-// Jupiter quote (SOL -> USDC)
-const JUP_URL = "https://quote-api.jup.ag/v6/quote";
-const SOL_MINT = "So11111111111111111111111111111111111111112";
-const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-
-// CoinGecko (public)
 const CG_URL =
   "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
 
-// Binance (public) — SOLUSDT ~ USD, very reliable on hosts
-const BINANCE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT";
+const BINANCE_URL =
+  "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT";
 
-// Birdeye (optional)
+const KRAKEN_URL =
+  "https://api.kraken.com/0/public/Ticker?pair=SOLUSD";
+
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const BIRDEYE_URL =
   "https://public-api.birdeye.so/defi/price?address=So11111111111111111111111111111111111111112";
 
-// Axios instance
 const ax = axios.create({
   timeout: TIMEOUT_MS,
-  headers: { "User-Agent": "paper-grid/1.1", Accept: "application/json" },
+  headers: { "User-Agent": "paper-grid/1.2", Accept: "application/json" },
 });
 
 // =====================
@@ -94,7 +82,7 @@ let anchor = null;
 let nowPrice = null;
 let priceSource = "N/A";
 let lastTickAt = 0;
-let lastPriceError = ""; // show something useful in /status if it fails
+let lastPriceError = "";
 
 let openPositions = []; // [{ id, entryPrice, qtySol, costUsd, openedAt }]
 let trades = [];        // last 10 trades [{ ts, side, price, qtySol, pnlUsd? }]
@@ -124,12 +112,6 @@ function round(n, dp = 2) {
   if (!Number.isFinite(n)) return n;
   const m = 10 ** dp;
   return Math.round(n * m) / m;
-}
-function fmt(n, dp = 2) {
-  return Number.isFinite(n) ? n.toFixed(dp) : "—";
-}
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
 }
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -194,62 +176,51 @@ function saveState() {
 async function fetchPriceFromCoinGecko() {
   const r = await ax.get(CG_URL);
   const p = Number(r?.data?.solana?.usd);
-  if (!Number.isFinite(p) || p <= 0) throw new Error("CoinGecko returned bad price");
+  if (!Number.isFinite(p) || p <= 0) throw new Error("CoinGecko bad price");
   return p;
 }
 
 async function fetchPriceFromBinance() {
   const r = await ax.get(BINANCE_URL);
   const p = Number(r?.data?.price);
-  if (!Number.isFinite(p) || p <= 0) throw new Error("Binance returned bad price");
+  if (!Number.isFinite(p) || p <= 0) throw new Error("Binance bad price");
   return p; // USDT ~ USD
 }
 
-async function fetchPriceFromJupiter() {
-  const inAmount = "1000000000"; // 1 SOL in lamports
-  const params = {
-    inputMint: SOL_MINT,
-    outputMint: USDC_MINT,
-    inAmount,
-    swapMode: "ExactIn",
-    slippageBps: 50,
-  };
-  const r = await ax.get(JUP_URL, { params });
-  const outAmount = Number(r?.data?.outAmount); // USDC 6 decimals
-  if (!Number.isFinite(outAmount) || outAmount <= 0) throw new Error("Jupiter returned bad outAmount");
-  return outAmount / 1e6;
+async function fetchPriceFromKraken() {
+  const r = await ax.get(KRAKEN_URL);
+  const pair = r?.data?.result?.SOLUSD;
+  const p = Number(pair?.c?.[0]);
+  if (!Number.isFinite(p) || p <= 0) throw new Error("Kraken bad price");
+  return p;
 }
 
 async function fetchPriceFromBirdeye() {
-  if (!BIRDEYE_API_KEY) throw new Error("No Birdeye key set");
+  if (!BIRDEYE_API_KEY) throw new Error("No Birdeye key");
   const r = await ax.get(BIRDEYE_URL, {
     headers: { "X-API-KEY": BIRDEYE_API_KEY },
   });
   const p = Number(r?.data?.data?.value);
-  if (!Number.isFinite(p) || p <= 0) throw new Error("Birdeye returned bad price");
+  if (!Number.isFinite(p) || p <= 0) throw new Error("Birdeye bad price");
   return p;
 }
 
 /**
- * Render-friendly price fetch:
- * - Prefer CoinGecko first (often works when JUP flakes)
- * - Then Binance (very reliable)
- * - Then Jupiter
- * - Then Birdeye (if key provided)
- * Includes retry/backoff.
+ * Robust price fetch for Render:
+ * - NO JUP (Render DNS ENOTFOUND quote-api.jup.ag)
+ * - Try multiple public sources with short backoffs
  */
 async function fetchSolPriceRobust() {
   const sources = [
-    { name: "CG", fn: fetchPriceFromCoinGecko },
     { name: "BINANCE", fn: fetchPriceFromBinance },
-    { name: "JUP", fn: fetchPriceFromJupiter },
+    { name: "CG", fn: fetchPriceFromCoinGecko },
+    { name: "KRAKEN", fn: fetchPriceFromKraken },
     ...(BIRDEYE_API_KEY ? [{ name: "BIRDEYE", fn: fetchPriceFromBirdeye }] : []),
   ];
 
-  // Retry rounds (fast then slightly slower)
   const backoffs = [0, 800, 1600];
-
   let lastErr = null;
+
   for (const waitMs of backoffs) {
     if (waitMs) await sleep(waitMs);
 
@@ -318,7 +289,7 @@ function recomputeAvgEntry() {
   stats.avgEntry = totalQty > 0 ? (totalCost / totalQty) : null;
 }
 function breakeven() {
-  return stats.avgEntry; // ignoring fees for paper
+  return stats.avgEntry; // paper: ignore fees
 }
 
 // =====================
@@ -356,8 +327,7 @@ function placeBuyAtPrice(fillPrice) {
 function placeSellAtPrice(fillPrice) {
   if (!openPositions.length) return false;
 
-  // Close oldest (FIFO-ish)
-  const pos = openPositions.shift();
+  const pos = openPositions.shift(); // FIFO-ish
   const qtySol = pos.qtySol;
 
   if (balances.sol < qtySol) {
@@ -386,7 +356,7 @@ function simulateFills() {
   if (!nowPrice || !anchor) return;
   ensureLadder();
 
-  // BUY fills (closest outward)
+  // BUY fills
   for (const rung of ladderBuys) {
     if (rung.state === "FILLED") continue;
     if (nowPrice <= rung.price) {
@@ -772,7 +742,6 @@ async function tick() {
     lastTickAt = Date.now();
     lastPriceError = "";
 
-    // Init anchor on first successful price
     if (!anchor) {
       anchor = price;
       const { buys, sells } = buildLadder(anchor);
@@ -781,9 +750,7 @@ async function tick() {
       console.log(iso(), "INIT", "anchor=", round(anchor, 4), "src=", priceSource);
     }
 
-    // simulate fills
     simulateFills();
-
     saveState();
 
     console.log(
@@ -793,8 +760,6 @@ async function tick() {
   } catch (e) {
     lastPriceError = (e?.message || String(e)).slice(0, 180);
     console.log(iso(), "PRICE_FETCH_FAILED", lastPriceError);
-
-    // Don’t wipe existing nowPrice/anchor; keep last known values if any
     saveState();
   }
 }
@@ -804,9 +769,9 @@ async function main() {
   loadState();
   startServer();
 
-  // Run a few quick boot ticks so it initializes faster after sleep/wake
+  // quick boot ticks so it initializes faster after Render wakes
   await tick();
-  await sleep(1500);
+  await sleep(1200);
   await tick();
 
   setInterval(() => tick().catch(() => {}), TICK_MS);
