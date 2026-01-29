@@ -1,19 +1,21 @@
 /**
- * runPaper.js (FULL REWRITE)
- * -------------------------
- * Paper grid bot + web UI status endpoint that includes anchor changes.
+ * runPaper.js — DARK LADDER UI + % GRID + ASYMMETRIC STEPS
+ * --------------------------------------------------------
+ * This is a full, self-contained script that restores a “dark ladder dashboard”
+ * style UI and implements:
  *
- * Features:
- * - SOL/USD price fetch (Jupiter + CoinGecko fallback + optional Birdeye)
- * - Symmetric grid around an anchor
- * - Paper fills
- * - Auto re-anchor with guardrails (drift + cooldown + no recent fills + usage cap)
- * - Web endpoint:
- *    GET /status  -> JSON including anchorPrice, lastReanchorAt, anchorDriftPct, recentlyReanchored
- *    GET /        -> simple HTML page showing live status (including anchor changes)
+ * ✅ #1 Percent spacing (not $0.50)
+ * ✅ #2 Asymmetric spacing (buys wider, sells tighter)
+ * ✅ Packet cap + guard (won’t buy beyond sell coverage)
+ * ✅ Paper fills + simple PnL (avg entry / breakeven)
+ * ✅ Web UI on Render (/) + JSON (/status)
  *
- * Run:
+ * Run locally:
  *   node runPaper.js
+ *
+ * Render:
+ *   Start command: node runPaper.js
+ *   Uses PORT env if provided, else 3000
  *
  * Optional ENV:
  *   BIRDEYE_API_KEY=xxxx
@@ -21,182 +23,172 @@
 
 import axios from "axios";
 import http from "http";
-import dns from "dns";
 import fs from "fs";
 
 // =====================
-// CONFIG (easy tweaks)
+// CONFIG (YOUR CHOICES)
 // =====================
 const TIMEOUT_MS = 15000;
 
-// intervals
-const PRICE_INTERVAL_MS = 30_000; // price + strategy tick
-const HEARTBEAT_MS = 60_000;      // less spam
-const KEEPALIVE_MS = 60_000;      // keeps local loop active too
+// Loop intervals
+const TICK_MS = 30_000;
+const UI_REFRESH_HINT_MS = 3000;
 
-// web server
-const WEB_PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+// Packets (capacity)
+const BUY_PACKETS = 6;
+const SELL_PACKETS = 6;
 
-// grid settings
-const GRID_LEVELS_EACH_SIDE = 10;  // number of buy levels + number of sell levels
-const GRID_STEP_PCT = 0.01;        // 1% spacing
-const ORDER_NOTIONAL_USD = 25;     // per packet size (paper)
-const MAX_OPEN_PER_SIDE = 10;      // cap open orders each side
+// Ladder depth shown on page
+const LEVELS_EACH_SIDE = 10;
 
-// paper balances
+// ✅ #1 + #2 (the improvements you chose)
+const BUY_STEP_PCT = 0.008;  // 0.8% between buy rungs (wider)
+const SELL_STEP_PCT = 0.006; // 0.6% between sell rungs (tighter)
+
+// Order sizing (paper)
+const ORDER_NOTIONAL_USD = 25;
+
+// Starting balances
 const START_USD = 1000;
 const START_SOL = 0;
 
-// paper fill behavior
-const SIM_SLIPPAGE_PCT = 0.0; // fills at level price by default
+// If you want a tiny simulated slippage, set > 0
+const SIM_SLIPPAGE_PCT = 0.0;
 
-// =====================
-// AUTO RE-ANCHOR CONFIG
-// =====================
-const AUTO_REANCHOR_ENABLED = true;
-const REANCHOR_TRIGGER_PCT = 0.04;                 // 4% drift from anchor
-const REANCHOR_COOLDOWN_MS = 45 * 60 * 1000;        // 45 minutes
-const REANCHOR_NO_FILL_WINDOW_MS = 10 * 60 * 1000;  // 10 minutes since last fill
-const REANCHOR_MAX_USAGE_PCT = 0.80;                // 80% open order usage
-const REANCHOR_RECENT_BADGE_MS = 30_000;            // "recently re-anchored" badge window
+// Web server
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+
+// Persistence
+const STATE_FILE = "./paper_state_dark.json";
 
 // =====================
 // PRICE SOURCES
 // =====================
-// Jupiter quote (SOL -> USDC)
 const JUP_URL = "https://quote-api.jup.ag/v6/quote";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-
-// CoinGecko (public fallback)
 const CG_URL =
   "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
 
-// Birdeye (optional)
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
 const BIRDEYE_URL =
   "https://public-api.birdeye.so/defi/price?address=So11111111111111111111111111111111111111112";
 
+const ax = axios.create({
+  timeout: TIMEOUT_MS,
+  headers: { "User-Agent": "paper-grid/1.0", Accept: "application/json" },
+});
+
 // =====================
 // STATE
 // =====================
-let anchorPrice = null;
-let lastReanchorAt = 0;
-let lastFillAt = 0;
+let anchor = null;
+let nowPrice = null;
+let priceSource = "N/A";
+let lastTickAt = 0;
 
-let lastPrice = null;
-let lastPriceSource = "N/A";
+// “Packets” are just how many open positions are allowed.
+// Each fill creates an open position. Each sell closes one.
+let openPositions = []; // [{ id, entryPrice, qtySol, costUsd, openedAt }]
+let trades = [];        // last N trades [{ ts, side, price, qtySol, pnlUsd? }]
 
-let openOrders = []; // {id, side:'BUY'|'SELL', price, qtySol, notionalUsd, createdAt}
-let nextOrderId = 1;
+// Ladder rungs tracked as stateful "slots" for UI
+let ladderBuys = [];  // [{ price, state:'WAIT'|'FILLED' }]
+let ladderSells = []; // [{ price, state:'WAIT'|'FILLED' }]
 
+// Balances + stats
 let balances = {
   usd: START_USD,
   sol: START_SOL,
-  startUsd: START_USD,
-  startSol: START_SOL,
 };
 
 let stats = {
-  fills: 0,
+  trades: 0,
   buys: 0,
   sells: 0,
   realizedPnlUsd: 0,
-  avgCostUsdPerSol: 0, // moving avg cost of current SOL position
+  avgEntry: null, // avg entry across open positions
 };
 
-const STATE_FILE = "./paper_state.json";
+let nextId = 1;
 
 // =====================
 // UTIL
 // =====================
-function nowIso() {
+function iso() {
   return new Date().toISOString();
 }
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-function pctDiff(a, b) {
-  if (!a || !b) return 0;
-  return Math.abs(a - b) / b;
-}
-function round(n, dp = 4) {
+function round(n, dp = 2) {
   if (!Number.isFinite(n)) return n;
   const m = 10 ** dp;
   return Math.round(n * m) / m;
 }
+function fmt(n, dp = 2) {
+  return Number.isFinite(n) ? n.toFixed(dp) : "—";
+}
+function pct(n, dp = 2) {
+  return Number.isFinite(n) ? (n * 100).toFixed(dp) + "%" : "—";
+}
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
 
 // =====================
-// PERSISTENCE
+// SAVE / LOAD
 // =====================
 function loadState() {
   try {
     if (!fs.existsSync(STATE_FILE)) return;
-    const raw = fs.readFileSync(STATE_FILE, "utf8");
-    const s = JSON.parse(raw);
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
 
-    anchorPrice = s.anchorPrice ?? anchorPrice;
-    lastReanchorAt = s.lastReanchorAt ?? lastReanchorAt;
-    lastFillAt = s.lastFillAt ?? lastFillAt;
+    anchor = s.anchor ?? anchor;
+    nowPrice = s.nowPrice ?? nowPrice;
+    priceSource = s.priceSource ?? priceSource;
+    lastTickAt = s.lastTickAt ?? lastTickAt;
 
-    openOrders = Array.isArray(s.openOrders) ? s.openOrders : openOrders;
-    nextOrderId = s.nextOrderId ?? nextOrderId;
+    openPositions = Array.isArray(s.openPositions) ? s.openPositions : openPositions;
+    trades = Array.isArray(s.trades) ? s.trades : trades;
+
+    ladderBuys = Array.isArray(s.ladderBuys) ? s.ladderBuys : ladderBuys;
+    ladderSells = Array.isArray(s.ladderSells) ? s.ladderSells : ladderSells;
 
     balances = s.balances ?? balances;
     stats = s.stats ?? stats;
+    nextId = s.nextId ?? nextId;
 
-    lastPrice = s.lastPrice ?? lastPrice;
-    lastPriceSource = s.lastPriceSource ?? lastPriceSource;
-
-    console.log(nowIso(), "STATE_LOADED");
+    console.log(iso(), "STATE_LOADED");
   } catch (e) {
-    console.log(nowIso(), "STATE_LOAD_FAILED", e?.message || e);
+    console.log(iso(), "STATE_LOAD_FAILED", e?.message || e);
   }
 }
 
 function saveState() {
   try {
     const s = {
-      anchorPrice,
-      lastReanchorAt,
-      lastFillAt,
-      openOrders,
-      nextOrderId,
+      anchor,
+      nowPrice,
+      priceSource,
+      lastTickAt,
+      openPositions,
+      trades,
+      ladderBuys,
+      ladderSells,
       balances,
       stats,
-      lastPrice,
-      lastPriceSource,
+      nextId,
       savedAt: Date.now(),
     };
     fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
   } catch (e) {
-    console.log(nowIso(), "STATE_SAVE_FAILED", e?.message || e);
+    console.log(iso(), "STATE_SAVE_FAILED", e?.message || e);
   }
 }
 
 // =====================
-// NETWORK HELPERS
-// =====================
-async function ensureDnsOnce() {
-  return new Promise((resolve) => {
-    dns.lookup("quote-api.jup.ag", () => resolve());
-  });
-}
-
-const ax = axios.create({
-  timeout: TIMEOUT_MS,
-  headers: {
-    "User-Agent": "sol-paper-grid/1.0",
-    Accept: "application/json",
-  },
-});
-
-// =====================
-// PRICE FETCHERS
+// PRICE FETCH
 // =====================
 async function fetchPriceFromJupiter() {
-  // 1 SOL = 1e9 lamports
-  const inAmount = "1000000000";
+  const inAmount = "1000000000"; // 1 SOL (lamports)
   const params = {
     inputMint: SOL_MINT,
     outputMint: USDC_MINT,
@@ -204,446 +196,546 @@ async function fetchPriceFromJupiter() {
     swapMode: "ExactIn",
     slippageBps: 50,
   };
-
   const r = await ax.get(JUP_URL, { params });
-  const outAmount = Number(r?.data?.outAmount); // USDC has 6 decimals
-  if (!Number.isFinite(outAmount) || outAmount <= 0) {
-    throw new Error("Bad outAmount from Jupiter");
-  }
+  const outAmount = Number(r?.data?.outAmount); // USDC 6 decimals
+  if (!Number.isFinite(outAmount) || outAmount <= 0) throw new Error("Bad Jupiter outAmount");
   return outAmount / 1e6;
 }
 
 async function fetchPriceFromCoinGecko() {
   const r = await ax.get(CG_URL);
-  const usd = Number(r?.data?.solana?.usd);
-  if (!Number.isFinite(usd) || usd <= 0) throw new Error("Bad CoinGecko price");
-  return usd;
+  const p = Number(r?.data?.solana?.usd);
+  if (!Number.isFinite(p) || p <= 0) throw new Error("Bad CoinGecko price");
+  return p;
 }
 
 async function fetchPriceFromBirdeye() {
-  if (!BIRDEYE_API_KEY) throw new Error("No Birdeye API key set");
+  if (!BIRDEYE_API_KEY) throw new Error("No Birdeye key");
   const r = await ax.get(BIRDEYE_URL, {
     headers: { "X-API-KEY": BIRDEYE_API_KEY },
   });
-  const usd = Number(r?.data?.data?.value);
-  if (!Number.isFinite(usd) || usd <= 0) throw new Error("Bad Birdeye price");
-  return usd;
+  const p = Number(r?.data?.data?.value);
+  if (!Number.isFinite(p) || p <= 0) throw new Error("Bad Birdeye price");
+  return p;
 }
 
 async function fetchSolPrice() {
-  const attempts = [
+  const sources = [
     { name: "JUP", fn: fetchPriceFromJupiter },
     { name: "CG", fn: fetchPriceFromCoinGecko },
     ...(BIRDEYE_API_KEY ? [{ name: "BIRDEYE", fn: fetchPriceFromBirdeye }] : []),
   ];
 
   let lastErr = null;
-  for (const a of attempts) {
+  for (const s of sources) {
     try {
-      const p = await a.fn();
-      return { price: p, source: a.name };
+      const price = await s.fn();
+      return { price, source: s.name };
     } catch (e) {
       lastErr = e;
     }
   }
-  throw lastErr || new Error("All price sources failed");
+  throw lastErr || new Error("All sources failed");
 }
 
 // =====================
-// GRID
+// LADDER BUILD (PCT + ASYMMETRIC)
 // =====================
-function buildGrid(anchor) {
-  const levels = [];
-  for (let i = 1; i <= GRID_LEVELS_EACH_SIDE; i++) {
-    levels.push({ side: "BUY", price: anchor * (1 - GRID_STEP_PCT * i) });
-    levels.push({ side: "SELL", price: anchor * (1 + GRID_STEP_PCT * i) });
+function buildLadder(a) {
+  const buys = [];
+  const sells = [];
+
+  for (let i = 1; i <= LEVELS_EACH_SIDE; i++) {
+    const buyPrice = a * (1 - BUY_STEP_PCT * i);
+    const sellPrice = a * (1 + SELL_STEP_PCT * i);
+    buys.push({ price: buyPrice, state: "WAIT" });
+    sells.push({ price: sellPrice, state: "WAIT" });
   }
 
-  const buys = levels.filter(l => l.side === "BUY").sort((a, b) => b.price - a.price);
-  const sells = levels.filter(l => l.side === "SELL").sort((a, b) => a.price - b.price);
+  // Closest to anchor first
+  buys.sort((x, y) => y.price - x.price);
+  sells.sort((x, y) => x.price - y.price);
+
   return { buys, sells };
 }
 
-function makeOrder(side, price) {
-  const notionalUsd = ORDER_NOTIONAL_USD;
-  const qtySol = notionalUsd / price;
-  return {
-    id: nextOrderId++,
-    side,
-    price,
+function ensureLadder() {
+  if (!anchor) return;
+  if (!ladderBuys.length || !ladderSells.length) {
+    const { buys, sells } = buildLadder(anchor);
+    ladderBuys = buys;
+    ladderSells = sells;
+  }
+}
+
+// =====================
+// PACKETS / GUARD
+// =====================
+function openCount() {
+  return openPositions.length;
+}
+function buyPacketsRemaining() {
+  return Math.max(0, BUY_PACKETS - openCount());
+}
+function sellPacketsRemaining() {
+  // Sell packets represent how many exits are planned.
+  // In this model, each open position consumes a sell packet capacity.
+  return Math.max(0, SELL_PACKETS - openCount());
+}
+function guardBlocksBuyNext() {
+  // "blocks BUY when open+1 > sell packets"
+  return (openCount() + 1) > SELL_PACKETS;
+}
+
+// =====================
+// POSITION / PNL
+// =====================
+function recomputeAvgEntry() {
+  if (!openPositions.length) {
+    stats.avgEntry = null;
+    return;
+  }
+  const totalQty = openPositions.reduce((s, p) => s + p.qtySol, 0);
+  const totalCost = openPositions.reduce((s, p) => s + p.costUsd, 0);
+  stats.avgEntry = totalQty > 0 ? (totalCost / totalQty) : null;
+}
+
+function breakeven() {
+  // For paper, use avg entry as breakeven (ignoring fees)
+  return stats.avgEntry;
+}
+
+// =====================
+// PAPER EXECUTION
+// =====================
+function placeBuyAtPrice(fillPrice) {
+  const qtySol = ORDER_NOTIONAL_USD / fillPrice;
+  const costUsd = qtySol * fillPrice;
+
+  if (balances.usd < costUsd) return false;
+  if (openCount() >= BUY_PACKETS) return false;
+  if (guardBlocksBuyNext()) return false;
+
+  balances.usd -= costUsd;
+  balances.sol += qtySol;
+
+  openPositions.push({
+    id: nextId++,
+    entryPrice: fillPrice,
     qtySol,
-    notionalUsd,
-    createdAt: Date.now(),
-  };
+    costUsd,
+    openedAt: Date.now(),
+  });
+
+  stats.trades++;
+  stats.buys++;
+
+  trades.unshift({
+    ts: Date.now(),
+    side: "BUY",
+    price: fillPrice,
+    qtySol,
+  });
+  trades = trades.slice(0, 10);
+
+  recomputeAvgEntry();
+  return true;
 }
 
-function clearOpenOrders() {
-  openOrders = [];
-}
+function placeSellAtPrice(fillPrice) {
+  if (!openPositions.length) return false;
 
-function seedOpenOrdersFromGrid(anchor) {
-  const { buys, sells } = buildGrid(anchor);
+  // Close the oldest position (FIFO-ish)
+  const pos = openPositions.shift();
+  const qtySol = pos.qtySol;
 
-  const wantBuys = buys.slice(0, MAX_OPEN_PER_SIDE);
-  const wantSells = sells.slice(0, MAX_OPEN_PER_SIDE);
-
-  const newOrders = [];
-
-  for (const lvl of wantBuys) newOrders.push(makeOrder("BUY", lvl.price));
-  for (const lvl of wantSells) newOrders.push(makeOrder("SELL", lvl.price));
-
-  openOrders = newOrders;
-}
-
-function getUsagePct() {
-  const buysOpen = openOrders.filter(o => o.side === "BUY").length;
-  const sellsOpen = openOrders.filter(o => o.side === "SELL").length;
-  return {
-    buysUsedPct: clamp(buysOpen / Math.max(1, MAX_OPEN_PER_SIDE), 0, 1),
-    sellsUsedPct: clamp(sellsOpen / Math.max(1, MAX_OPEN_PER_SIDE), 0, 1),
-  };
-}
-
-function topUpOrders() {
-  if (!anchorPrice) return;
-
-  const { buys, sells } = buildGrid(anchorPrice);
-
-  const buysOpen = openOrders.filter(o => o.side === "BUY");
-  const sellsOpen = openOrders.filter(o => o.side === "SELL");
-
-  const openBuyPrices = new Set(buysOpen.map(o => round(o.price, 6)));
-  const openSellPrices = new Set(sellsOpen.map(o => round(o.price, 6)));
-
-  for (const lvl of buys) {
-    if (buysOpen.length >= MAX_OPEN_PER_SIDE) break;
-    const p = round(lvl.price, 6);
-    if (openBuyPrices.has(p)) continue;
-    const o = makeOrder("BUY", lvl.price);
-    openOrders.push(o);
-    buysOpen.push(o);
-    openBuyPrices.add(p);
+  if (balances.sol < qtySol) {
+    // Shouldn't happen in paper, but guard it
+    openPositions.unshift(pos);
+    return false;
   }
 
-  for (const lvl of sells) {
-    if (sellsOpen.length >= MAX_OPEN_PER_SIDE) break;
-    const p = round(lvl.price, 6);
-    if (openSellPrices.has(p)) continue;
-    const o = makeOrder("SELL", lvl.price);
-    openOrders.push(o);
-    sellsOpen.push(o);
-    openSellPrices.add(p);
-  }
+  const proceedsUsd = qtySol * fillPrice;
+  balances.sol -= qtySol;
+  balances.usd += proceedsUsd;
+
+  const pnl = proceedsUsd - pos.costUsd;
+  stats.realizedPnlUsd += pnl;
+
+  stats.trades++;
+  stats.sells++;
+
+  trades.unshift({
+    ts: Date.now(),
+    side: "SELL",
+    price: fillPrice,
+    qtySol,
+    pnlUsd: pnl,
+  });
+  trades = trades.slice(0, 10);
+
+  recomputeAvgEntry();
+  return true;
 }
 
-// =====================
-// AUTO RE-ANCHOR
-// =====================
-function shouldReanchor({
-  now,
-  currentPrice,
-  anchorPrice,
-  lastReanchorAt,
-  lastFillAt,
-  buysUsedPct,
-  sellsUsedPct,
-}) {
-  if (!AUTO_REANCHOR_ENABLED) return { ok: false, reason: "disabled" };
-  if (!anchorPrice || !Number.isFinite(anchorPrice)) return { ok: false, reason: "no_anchor" };
-  if (!currentPrice || !Number.isFinite(currentPrice)) return { ok: false, reason: "bad_price" };
+function simulateFills() {
+  if (!nowPrice || !anchor) return;
+  ensureLadder();
 
-  const drift = pctDiff(currentPrice, anchorPrice);
-  if (drift < REANCHOR_TRIGGER_PCT) return { ok: false, reason: "drift_small", drift };
-
-  if (now - lastReanchorAt < REANCHOR_COOLDOWN_MS) {
-    return { ok: false, reason: "cooldown", drift };
-  }
-
-  if (now - lastFillAt < REANCHOR_NO_FILL_WINDOW_MS) {
-    return { ok: false, reason: "recent_fill", drift };
-  }
-
-  if (buysUsedPct >= REANCHOR_MAX_USAGE_PCT || sellsUsedPct >= REANCHOR_MAX_USAGE_PCT) {
-    return { ok: false, reason: "usage_high", drift, buysUsedPct, sellsUsedPct };
-  }
-
-  return { ok: true, reason: "reanchor", drift };
-}
-
-function reanchorGrid(currentPrice) {
-  anchorPrice = currentPrice;
-  lastReanchorAt = Date.now();
-
-  clearOpenOrders();
-  seedOpenOrdersFromGrid(anchorPrice);
-
-  console.log(nowIso(), `AUTO_REANCHOR: new_anchor=${round(anchorPrice, 4)}`);
-}
-
-// =====================
-// PAPER FILLS
-// =====================
-function tryFillOrders(currentPrice) {
-  const buys = openOrders
-    .filter(o => o.side === "BUY")
-    .sort((a, b) => b.price - a.price);
-  const sells = openOrders
-    .filter(o => o.side === "SELL")
-    .sort((a, b) => a.price - b.price);
-
-  const filledIds = new Set();
-
-  // BUY fills
-  for (const o of buys) {
-    if (currentPrice > o.price) continue;
-
-    const fillPrice = o.price * (1 + SIM_SLIPPAGE_PCT);
-    const costUsd = o.qtySol * fillPrice;
-
-    if (balances.usd >= costUsd) {
-      balances.usd -= costUsd;
-      balances.sol += o.qtySol;
-
-      // moving avg cost update
-      const prevSol = balances.sol - o.qtySol;
-      const prevCost = stats.avgCostUsdPerSol * prevSol;
-      const newCost = prevCost + costUsd;
-      stats.avgCostUsdPerSol = balances.sol > 0 ? newCost / balances.sol : 0;
-
-      stats.fills++;
-      stats.buys++;
-      lastFillAt = Date.now();
-      filledIds.add(o.id);
-
-      console.log(nowIso(), `FILL BUY  id=${o.id} price=${round(fillPrice, 4)} qty=${round(o.qtySol, 6)}`);
+  // BUY: fill if now <= rung price
+  // Fill from closest rung outward to simulate realistic sweep
+  for (const rung of ladderBuys) {
+    if (rung.state === "FILLED") continue;
+    if (nowPrice <= rung.price) {
+      const fillPrice = rung.price * (1 + SIM_SLIPPAGE_PCT);
+      const ok = placeBuyAtPrice(fillPrice);
+      if (ok) rung.state = "FILLED";
+      else break; // if we couldn't buy (guard/cash), stop
     }
   }
 
-  // SELL fills
-  for (const o of sells) {
-    if (currentPrice < o.price) continue;
-
-    const fillPrice = o.price * (1 - SIM_SLIPPAGE_PCT);
-    const qty = o.qtySol;
-
-    if (balances.sol >= qty) {
-      balances.sol -= qty;
-      const proceedsUsd = qty * fillPrice;
-      balances.usd += proceedsUsd;
-
-      const costBasis = qty * stats.avgCostUsdPerSol;
-      const pnl = proceedsUsd - costBasis;
-      stats.realizedPnlUsd += pnl;
-
-      if (balances.sol <= 0) stats.avgCostUsdPerSol = 0;
-
-      stats.fills++;
-      stats.sells++;
-      lastFillAt = Date.now();
-      filledIds.add(o.id);
-
-      console.log(nowIso(), `FILL SELL id=${o.id} price=${round(fillPrice, 4)} qty=${round(qty, 6)} pnl=${round(pnl, 2)}`);
+  // SELL: fill if now >= rung price
+  for (const rung of ladderSells) {
+    if (rung.state === "FILLED") continue;
+    if (nowPrice >= rung.price) {
+      const fillPrice = rung.price * (1 - SIM_SLIPPAGE_PCT);
+      const ok = placeSellAtPrice(fillPrice);
+      if (ok) rung.state = "FILLED";
+      else break; // no positions to sell
     }
   }
-
-  if (filledIds.size > 0) {
-    openOrders = openOrders.filter(o => !filledIds.has(o.id));
-    topUpOrders();
-  }
 }
 
 // =====================
-// STATUS HELPERS
+// RESET / RE-ANCHOR (MANUAL ONLY IN THIS VERSION)
 // =====================
-function portfolioValueUsd(markPrice) {
-  return balances.usd + balances.sol * markPrice;
+function resetAndReanchor(newAnchor) {
+  anchor = newAnchor;
+  ladderBuys = [];
+  ladderSells = [];
+  ensureLadder();
+
+  // Reset rung states based on current positions (keep positions)
+  // We keep openPositions intact; rung "FILLED" is just UI history.
+  console.log(iso(), "REANCHOR_MANUAL", "anchor=", round(anchor, 4));
 }
 
-function computeStatus() {
-  const driftPct =
-    anchorPrice && lastPrice
-      ? Math.abs(lastPrice - anchorPrice) / anchorPrice
-      : null;
+// =====================
+// STATUS
+// =====================
+function portfolioValueUsd() {
+  if (!Number.isFinite(nowPrice)) return null;
+  return balances.usd + balances.sol * nowPrice;
+}
 
-  const recentlyReanchored = Date.now() - lastReanchorAt < REANCHOR_RECENT_BADGE_MS;
-
-  const pv = lastPrice ? portfolioValueUsd(lastPrice) : null;
-  const startPv = lastPrice
-    ? balances.startUsd + balances.startSol * lastPrice
-    : null;
-
-  const totalPnl = (pv != null && startPv != null) ? (pv - startPv) : null;
-
-  const buysOpen = openOrders.filter(o => o.side === "BUY").length;
-  const sellsOpen = openOrders.filter(o => o.side === "SELL").length;
+function statusObj() {
+  const drift = (anchor && nowPrice) ? (Math.abs(nowPrice - anchor) / anchor) : null;
+  const pv = portfolioValueUsd();
 
   return {
     ts: Date.now(),
-    iso: nowIso(),
+    iso: iso(),
+    nowPrice,
+    priceSource,
+    anchor,
+    drift,
 
-    price: lastPrice,
-    priceSource: lastPriceSource,
-
-    anchorPrice,
-    lastReanchorAt,
-    anchorDriftPct: driftPct,
-    recentlyReanchored,
-
-    balances,
-    stats,
-
-    openOrders: {
-      total: openOrders.length,
-      buys: buysOpen,
-      sells: sellsOpen,
+    config: {
+      BUY_PACKETS,
+      SELL_PACKETS,
+      LEVELS_EACH_SIDE,
+      BUY_STEP_PCT,
+      SELL_STEP_PCT,
+      ORDER_NOTIONAL_USD,
     },
 
-    pvUsd: pv,
-    totalPnlUsd: totalPnl,
+    balances,
+    stats: {
+      ...stats,
+      openPositions: openCount(),
+      buyPackets: BUY_PACKETS,
+      sellPackets: SELL_PACKETS,
+      buyPacketsRemaining: buyPacketsRemaining(),
+      sellPacketsRemaining: sellPacketsRemaining(),
+      guard: "blocks BUY when open+1 > sell packets",
+      guardBlocked: guardBlocksBuyNext(),
+      breakeven: breakeven(),
+      portfolioValueUsd: pv,
+    },
+
+    ladder: {
+      buys: ladderBuys,
+      sells: ladderSells,
+    },
+
+    trades,
   };
 }
 
-function printConsoleStatus() {
-  if (!lastPrice) {
-    console.log(nowIso(), "STATUS price=N/A");
-    return;
-  }
-
-  const s = computeStatus();
-  const driftStr = s.anchorDriftPct == null ? "–" : `${round(s.anchorDriftPct * 100, 2)}%`;
-  const badge = s.recentlyReanchored ? " 🔁" : "";
-
-  console.log(
-    "\n" +
-      s.iso,
-    `PRICE=${round(s.price, 4)} src=${s.priceSource} anchor=${s.anchorPrice ? round(s.anchorPrice, 4) : "N/A"} drift=${driftStr}${badge}`
-  );
-
-  console.log(
-    `Bal: USD=${round(balances.usd, 2)} SOL=${round(balances.sol, 6)} PV=$${round(s.pvUsd, 2)} TotalPnL=$${round(s.totalPnlUsd, 2)}`
-  );
-
-  console.log(
-    `Fills=${stats.fills} (buys=${stats.buys}, sells=${stats.sells}) RealizedPnL=$${round(stats.realizedPnlUsd, 2)} AvgCost=$${round(stats.avgCostUsdPerSol, 4)}`
-  );
-
-  console.log(
-    `OpenOrders: total=${s.openOrders.total} BUY=${s.openOrders.buys}/${MAX_OPEN_PER_SIDE} SELL=${s.openOrders.sells}/${MAX_OPEN_PER_SIDE}`
-  );
-}
-
 // =====================
-// WEB UI
+// DARK UI HTML
 // =====================
-function htmlPage() {
+function html() {
   return `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Paper Grid Bot</title>
+  <title>Paper Grid Ladder</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 16px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
-    .row { display:flex; gap:12px; flex-wrap:wrap; }
-    .k { opacity: 0.7; font-size: 12px; }
-    .v { font-size: 20px; font-weight: 700; }
-    .badge { display:inline-block; padding: 3px 8px; border-radius: 999px; border: 1px solid #ddd; font-size: 12px; margin-left: 8px; }
-    .muted { opacity: 0.7; }
-    pre { white-space: pre-wrap; word-break: break-word; }
+    :root{
+      --bg:#0b1220;
+      --card:#0f1a2e;
+      --card2:#0d1730;
+      --muted:rgba(255,255,255,.65);
+      --line:rgba(255,255,255,.08);
+      --good:#2ee59d;
+      --warn:#ffcc66;
+      --bad:#ff5c7a;
+      --txt:#e9eefc;
+    }
+    body{
+      margin:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: radial-gradient(1200px 700px at 20% 10%, rgba(60,120,255,.18), transparent 60%),
+                  radial-gradient(900px 600px at 90% 30%, rgba(46,229,157,.14), transparent 60%),
+                  var(--bg);
+      color: var(--txt);
+    }
+    .wrap{ max-width: 1020px; margin: 0 auto; padding: 16px; }
+    h1{ font-size: 18px; margin: 0 0 10px; opacity: .95; }
+    .grid{
+      display:grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 12px;
+      align-items:start;
+    }
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,.04), transparent 40%), var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+    }
+    .row{ display:flex; justify-content:space-between; gap:10px; align-items:baseline; }
+    .k{ font-size: 12px; color: var(--muted); }
+    .v{ font-size: 20px; font-weight: 800; letter-spacing: .2px; }
+    .sub{ font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .pill{
+      display:inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .pill.good{ color: var(--good); border-color: rgba(46,229,157,.35); }
+    .pill.bad{ color: var(--bad); border-color: rgba(255,92,122,.35); }
+    .ladder{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .coltitle{ font-size: 12px; color: var(--muted); margin: 2px 0 8px; }
+    .rung{
+      display:flex; justify-content:space-between; align-items:center;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      margin-bottom: 8px;
+      background: rgba(255,255,255,.02);
+    }
+    .state{
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+    .state.filled{ color: var(--good); border-color: rgba(46,229,157,.35); }
+    .state.wait{ color: var(--muted); }
+    .price{ font-weight: 800; }
+    .mid{
+      text-align:center;
+      padding: 16px 8px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(46,229,157,.07), rgba(60,120,255,.06));
+    }
+    .mid .big{ font-size: 26px; font-weight: 900; margin-top: 6px; }
+    .mid .small{ font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .list .item{
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255,255,255,.02);
+      padding: 10px;
+      margin-top: 8px;
+    }
+    .sidebuy{ color: var(--good); font-weight: 900; }
+    .sidesell{ color: var(--warn); font-weight: 900; }
+    .pnl{ font-weight: 900; }
+    .pnl.pos{ color: var(--good); }
+    .pnl.neg{ color: var(--bad); }
+    a{ color: var(--muted); text-decoration:none; }
+    .footer{ margin-top: 10px; font-size: 12px; color: var(--muted); }
   </style>
 </head>
 <body>
-  <h2>Paper Grid Bot</h2>
+  <div class="wrap">
+    <h1>Paper Grid Ladder <span class="pill" id="matchPill">…</span></h1>
 
-  <div class="card">
-    <div class="row">
-      <div>
-        <div class="k">SOL Price</div>
-        <div class="v" id="price">–</div>
-        <div class="muted" id="source">–</div>
+    <div class="grid">
+      <div class="card">
+        <div class="row">
+          <div>
+            <div class="k">Trades</div>
+            <div class="v" id="trades">—</div>
+          </div>
+          <div>
+            <div class="k">Buys / Sells</div>
+            <div class="v"><span id="buys">—</span> / <span id="sells">—</span></div>
+          </div>
+        </div>
+        <div class="sub">
+          Open positions: <b id="openPos">—</b><br/>
+          Sell packets: <b id="sellPackets">—</b> · Buy packets: <b id="buyPackets">—</b><br/>
+          Guard: <span id="guardText">—</span>
+        </div>
+        <div class="sub">
+          Avg entry: <b id="avgEntry">—</b> · Breakeven: <b id="breakeven">—</b><br/>
+          USD: <b id="usd">—</b> · SOL: <b id="sol">—</b> · PV: <b id="pv">—</b>
+        </div>
       </div>
-      <div>
-        <div class="k">Anchor</div>
-        <div class="v" id="anchor">–</div>
-        <div class="muted">Drift: <span id="drift">–</span><span class="badge" id="reanchorBadge" style="display:none;">re-anchored</span></div>
+
+      <div class="mid">
+        <div class="k">NOW</div>
+        <div class="big" id="now">—</div>
+        <div class="small" id="anchorLine">Anchor: — • Steps: — / —</div>
+        <div class="small" id="driftLine">Drift: — · src: —</div>
       </div>
-      <div>
-        <div class="k">Portfolio Value</div>
-        <div class="v" id="pv">–</div>
-        <div class="muted">Total PnL: <span id="pnl">–</span></div>
+
+      <div class="card list">
+        <div class="k">Last 10 trades</div>
+        <div id="tradeList"></div>
       </div>
     </div>
-  </div>
 
-  <div class="card">
-    <div class="row">
-      <div>
-        <div class="k">USD</div>
-        <div class="v" id="usd">–</div>
+    <div class="card" style="margin-top:12px;">
+      <div class="k">Ladder (fixed levels; colour/state changes)</div>
+      <div class="sub">Re-centering / movable anchor can be added later — this version is stable.</div>
+      <div class="ladder" style="margin-top:10px;">
+        <div>
+          <div class="coltitle">BUY (wider, ${ (BUY_STEP_PCT*100).toFixed(2) }% steps)</div>
+          <div id="buyCol"></div>
+        </div>
+        <div>
+          <div class="coltitle">SELL (tighter, ${ (SELL_STEP_PCT*100).toFixed(2) }% steps)</div>
+          <div id="sellCol"></div>
+        </div>
       </div>
-      <div>
-        <div class="k">SOL</div>
-        <div class="v" id="sol">–</div>
-      </div>
-      <div>
-        <div class="k">Open BUY / SELL</div>
-        <div class="v"><span id="buys">–</span> / <span id="sells">–</span></div>
+      <div class="footer">
+        JSON endpoint: <a href="/status">/status</a> · Refresh hint: ${UI_REFRESH_HINT_MS/1000}s
       </div>
     </div>
-  </div>
-
-  <div class="card">
-    <div class="k">Raw /status</div>
-    <pre id="raw">–</pre>
   </div>
 
 <script>
-async function refresh() {
-  try {
+  const fmt = (n, dp=2) => (typeof n === 'number' && isFinite(n)) ? n.toFixed(dp) : '—';
+  const money = (n) => (typeof n === 'number' && isFinite(n)) ? ('$' + n.toFixed(2)) : '—';
+
+  function rungHtml(p, state){
+    const st = state === 'FILLED' ? 'filled' : 'wait';
+    return \`
+      <div class="rung">
+        <div class="price">\${fmt(p, 2)}</div>
+        <div class="state \${st}">\${state}</div>
+      </div>\`;
+  }
+
+  function tradeHtml(t){
+    const sideClass = t.side === 'BUY' ? 'sidebuy' : 'sidesell';
+    const sideLabel = t.side === 'BUY' ? 'BUY' : 'SELL';
+    const pnl = (typeof t.pnlUsd === 'number') ? t.pnlUsd : null;
+    const pnlClass = pnl == null ? '' : (pnl >= 0 ? 'pos' : 'neg');
+
+    return \`
+      <div class="item">
+        <div class="row">
+          <div class="\${sideClass}">\${sideLabel}</div>
+          <div class="k">\${new Date(t.ts).toLocaleTimeString()}</div>
+        </div>
+        <div class="row" style="margin-top:6px;">
+          <div>Price: <b>\${fmt(t.price, 2)}</b></div>
+          <div>Qty: <b>\${fmt(t.qtySol, 6)}</b></div>
+        </div>
+        \${pnl == null ? '' : \`<div class="row" style="margin-top:6px;">
+          <div class="k">PnL</div>
+          <div class="pnl \${pnlClass}">\${money(pnl)}</div>
+        </div>\`}
+      </div>\`;
+  }
+
+  async function refresh(){
     const r = await fetch('/status', { cache: 'no-store' });
     const s = await r.json();
 
-    const fmt = (n, dp=4) => (typeof n === 'number' && isFinite(n)) ? n.toFixed(dp) : '–';
-    const money = (n) => (typeof n === 'number' && isFinite(n)) ? ('$' + n.toFixed(2)) : '–';
+    // Top stats
+    document.getElementById('trades').innerText = s.stats.trades ?? '—';
+    document.getElementById('buys').innerText = s.stats.buys ?? '—';
+    document.getElementById('sells').innerText = s.stats.sells ?? '—';
+    document.getElementById('openPos').innerText = s.stats.openPositions ?? '—';
+    document.getElementById('sellPackets').innerText = s.stats.sellPackets ?? '—';
+    document.getElementById('buyPackets').innerText = s.stats.buyPackets ?? '—';
 
-    document.getElementById('price').innerText = fmt(s.price, 4);
-    document.getElementById('source').innerText = 'src: ' + (s.priceSource || '–');
+    const guard = s.stats.guard ?? '—';
+    const blocked = !!s.stats.guardBlocked;
+    document.getElementById('guardText').innerText = guard + (blocked ? ' (BLOCKING)' : '');
+    document.getElementById('avgEntry').innerText = (typeof s.stats.avgEntry === 'number') ? fmt(s.stats.avgEntry, 2) : '—';
+    document.getElementById('breakeven').innerText = (typeof s.stats.breakeven === 'number') ? fmt(s.stats.breakeven, 2) : '—';
 
-    document.getElementById('anchor').innerText = fmt(s.anchorPrice, 4);
-    document.getElementById('drift').innerText =
-      (typeof s.anchorDriftPct === 'number' && isFinite(s.anchorDriftPct))
-        ? (s.anchorDriftPct * 100).toFixed(2) + '%'
-        : '–';
+    document.getElementById('usd').innerText = money(s.balances.usd);
+    document.getElementById('sol').innerText = fmt(s.balances.sol, 6);
+    document.getElementById('pv').innerText = money(s.stats.portfolioValueUsd);
 
-    const badge = document.getElementById('reanchorBadge');
-    badge.style.display = s.recentlyReanchored ? 'inline-block' : 'none';
+    // Matched pill
+    const matched = (s.stats.sellPackets >= s.stats.openPositions);
+    const pill = document.getElementById('matchPill');
+    pill.className = 'pill ' + (matched ? 'good' : 'bad');
+    pill.innerText = matched ? '✅ Matched: sells can cover open positions' : '⚠ Not matched';
 
-    document.getElementById('usd').innerText = money(s.balances?.usd);
-    document.getElementById('sol').innerText = fmt(s.balances?.sol, 6);
+    // Middle panel
+    document.getElementById('now').innerText = fmt(s.nowPrice, 2);
+    document.getElementById('anchorLine').innerText =
+      'Anchor: ' + fmt(s.anchor, 2) + ' • Steps: ' + (s.config.BUY_STEP_PCT*100).toFixed(2) + '% / ' + (s.config.SELL_STEP_PCT*100).toFixed(2) + '%';
+    document.getElementById('driftLine').innerText =
+      'Drift: ' + ((typeof s.drift === 'number') ? (s.drift*100).toFixed(2)+'%' : '—') + ' · src: ' + (s.priceSource || '—');
 
-    document.getElementById('buys').innerText = s.openOrders?.buys ?? '–';
-    document.getElementById('sells').innerText = s.openOrders?.sells ?? '–';
+    // Ladder
+    const buyCol = document.getElementById('buyCol');
+    const sellCol = document.getElementById('sellCol');
+    buyCol.innerHTML = (s.ladder.buys || []).map(x => rungHtml(x.price, x.state)).join('');
+    sellCol.innerHTML = (s.ladder.sells || []).map(x => rungHtml(x.price, x.state)).join('');
 
-    document.getElementById('pv').innerText = money(s.pvUsd);
-    document.getElementById('pnl').innerText = money(s.totalPnlUsd);
-
-    document.getElementById('raw').innerText = JSON.stringify(s, null, 2);
-  } catch (e) {
-    document.getElementById('raw').innerText = 'refresh failed: ' + (e && e.message ? e.message : e);
+    // Trades
+    const list = document.getElementById('tradeList');
+    const t = s.trades || [];
+    list.innerHTML = t.length ? t.map(tradeHtml).join('') : '<div class="item"><div class="k">No trades yet</div></div>';
   }
-}
-setInterval(refresh, 3000);
-refresh();
+
+  setInterval(refresh, ${UI_REFRESH_HINT_MS});
+  refresh().catch(()=>{});
 </script>
+
 </body>
 </html>`;
 }
 
-function startWebServer() {
+// =====================
+// WEB SERVER
+// =====================
+function startServer() {
   const server = http.createServer((req, res) => {
     if (req.url === "/status") {
-      const s = computeStatus();
+      const s = statusObj();
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
@@ -652,12 +744,24 @@ function startWebServer() {
       return;
     }
 
+    // Optional manual re-anchor endpoint (safe, but you can ignore)
+    // Example: /reanchor  (sets anchor to current nowPrice and rebuilds ladder)
+    if (req.url === "/reanchor") {
+      if (Number.isFinite(nowPrice)) {
+        resetAndReanchor(nowPrice);
+        saveState();
+      }
+      res.writeHead(302, { Location: "/" });
+      res.end();
+      return;
+    }
+
     if (req.url === "/" || req.url.startsWith("/?")) {
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",
       });
-      res.end(htmlPage());
+      res.end(html());
       return;
     }
 
@@ -665,101 +769,54 @@ function startWebServer() {
     res.end("Not found\n");
   });
 
-  server.listen(WEB_PORT, () => {
-    console.log(nowIso(), `WEB listening on http://localhost:${WEB_PORT}  (/) and (/status)`);
+  server.listen(PORT, () => {
+    console.log(iso(), `WEB listening on http://localhost:${PORT}`);
   });
 }
 
 // =====================
-// HEARTBEAT
+// MAIN LOOP
 // =====================
-function heartbeat() {
-  console.log(
-    nowIso(),
-    "HEARTBEAT",
-    `price=${lastPrice ? round(lastPrice, 4) : "N/A"} openOrders=${openOrders.length}`
-  );
-}
-
-// =====================
-// MAIN TICK
-// =====================
-async function priceAndStrategyTick() {
+async function tick() {
   try {
     const { price, source } = await fetchSolPrice();
-    lastPrice = price;
-    lastPriceSource = source;
+    nowPrice = price;
+    priceSource = source;
+    lastTickAt = Date.now();
 
-    // init anchor + seed orders once
-    if (!anchorPrice) {
-      anchorPrice = price;
-      clearOpenOrders();
-      seedOpenOrdersFromGrid(anchorPrice);
-      console.log(nowIso(), `INIT anchor=${round(anchorPrice, 4)}`);
+    // Init anchor on first tick
+    if (!anchor) {
+      anchor = price;
+      const { buys, sells } = buildLadder(anchor);
+      ladderBuys = buys;
+      ladderSells = sells;
+      console.log(iso(), "INIT", "anchor=", round(anchor, 4));
     }
 
-    // auto re-anchor
-    const { buysUsedPct, sellsUsedPct } = getUsagePct();
-    const decision = shouldReanchor({
-      now: Date.now(),
-      currentPrice: price,
-      anchorPrice,
-      lastReanchorAt,
-      lastFillAt,
-      buysUsedPct,
-      sellsUsedPct,
-    });
-
-    if (decision.ok) {
-      console.log(nowIso(), `AUTO_REANCHOR_TRIGGER drift=${round(decision.drift * 100, 2)}%`);
-      reanchorGrid(price);
-
-      // optional: skip fills on same tick as re-anchor for safety
-      printConsoleStatus();
-      saveState();
-      return;
-    }
-
-    // fills + top-up
-    tryFillOrders(price);
-
-    // status
-    printConsoleStatus();
+    // simulate fills + update
+    simulateFills();
     saveState();
+
+    // Console heartbeat (light)
+    console.log(
+      iso(),
+      `NOW=${round(nowPrice, 2)} anchor=${round(anchor, 2)} open=${openCount()}/${BUY_PACKETS} usd=${round(balances.usd, 2)} sol=${round(balances.sol, 4)}`
+    );
   } catch (e) {
-    console.log(nowIso(), "PRICE_FETCH_FAILED", e?.message || e);
+    console.log(iso(), "PRICE_FETCH_FAILED", e?.message || e);
   }
 }
 
-// =====================
-// BOOT
-// =====================
 async function main() {
   console.log("Paper bot started");
   loadState();
+  startServer();
 
-  await ensureDnsOnce();
-
-  startWebServer();
-
-  // first tick immediately
-  await priceAndStrategyTick();
-
-  // strategy loop
-  setInterval(() => {
-    priceAndStrategyTick().catch(() => {});
-  }, PRICE_INTERVAL_MS);
-
-  // heartbeat
-  setInterval(() => {
-    heartbeat();
-  }, HEARTBEAT_MS);
-
-  // keepalive no-op
-  setInterval(() => {}, KEEPALIVE_MS);
+  await tick();
+  setInterval(() => tick().catch(() => {}), TICK_MS);
 }
 
 main().catch((e) => {
-  console.log(nowIso(), "FATAL", e?.message || e);
+  console.log(iso(), "FATAL", e?.message || e);
   process.exit(1);
 });
