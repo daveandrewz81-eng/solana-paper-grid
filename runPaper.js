@@ -1,16 +1,12 @@
 /**
- * runPaper.js — DARK LADDER UI + % GRID (ASYMMETRIC) + RELIABLE PRICE (NO JUP)
- * --------------------------------------------------------------------------
- * Fix: Removes Jupiter entirely (Render DNS keeps failing: ENOTFOUND quote-api.jup.ag)
- * Price sources (in order): BINANCE -> COINGECKO -> KRAKEN -> (optional) BIRDEYE
- *
+ * runPaper.js — DARK LADDER UI + % GRID (ASYMMETRIC) + RELIABLE PRICE (NO JUP) + MICRO-SEED (PAPER)
+ * ------------------------------------------------------------------------------------------------
+ * Price sources (no Jupiter): BINANCE -> COINGECKO -> KRAKEN -> (optional) BIRDEYE
  * Strategy:
  *   ✅ Percent spacing
  *   ✅ Asymmetric steps (buys wider, sells tighter)
  *   ✅ Packets + guard
- *
- * UI:
- *   ✅ Same dark ladder layout (guard/packets + NOW + last trades + ladder)
+ *   ✅ Paper micro-seed (one-time starter inventory) so sells can happen without waiting for a dip
  *
  * Run:
  *   node runPaper.js
@@ -39,19 +35,28 @@ const SELL_PACKETS = 6;
 
 const LEVELS_EACH_SIDE = 10;
 
-// Your chosen improvements
+// Grid spacing (your chosen #1 + #2)
 const BUY_STEP_PCT = 0.008;   // 0.8% between buy rungs (wider)
 const SELL_STEP_PCT = 0.006;  // 0.6% between sell rungs (tighter)
 
+// Per-rung notional for normal fills (paper)
 const ORDER_NOTIONAL_USD = 25;
 
+// ✅ Paper micro-seed: one-time starter inventory
+// Set to 0 to disable.
+const MICRO_SEED_USD = 25;
+
+// Starting balances (paper)
 const START_USD = 1000;
 const START_SOL = 0;
 
+// Optional paper slippage
 const SIM_SLIPPAGE_PCT = 0.0;
 
+// Server
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
+// Persistence
 const STATE_FILE = "./paper_state_dark.json";
 
 // =====================
@@ -72,7 +77,7 @@ const BIRDEYE_URL =
 
 const ax = axios.create({
   timeout: TIMEOUT_MS,
-  headers: { "User-Agent": "paper-grid/1.2", Accept: "application/json" },
+  headers: { "User-Agent": "paper-grid/1.3", Accept: "application/json" },
 });
 
 // =====================
@@ -84,8 +89,8 @@ let priceSource = "N/A";
 let lastTickAt = 0;
 let lastPriceError = "";
 
-let openPositions = []; // [{ id, entryPrice, qtySol, costUsd, openedAt }]
-let trades = [];        // last 10 trades [{ ts, side, price, qtySol, pnlUsd? }]
+let openPositions = []; // [{ id, entryPrice, qtySol, costUsd, openedAt, microSeed? }]
+let trades = [];        // last 10 trades [{ ts, side, price, qtySol, pnlUsd?, note? }]
 
 let ladderBuys = [];    // [{ price, state:'WAIT'|'FILLED' }]
 let ladderSells = [];   // [{ price, state:'WAIT'|'FILLED' }]
@@ -205,11 +210,6 @@ async function fetchPriceFromBirdeye() {
   return p;
 }
 
-/**
- * Robust price fetch for Render:
- * - NO JUP (Render DNS ENOTFOUND quote-api.jup.ag)
- * - Try multiple public sources with short backoffs
- */
 async function fetchSolPriceRobust() {
   const sources = [
     { name: "BINANCE", fn: fetchPriceFromBinance },
@@ -223,7 +223,6 @@ async function fetchSolPriceRobust() {
 
   for (const waitMs of backoffs) {
     if (waitMs) await sleep(waitMs);
-
     for (const s of sources) {
       try {
         const price = await s.fn();
@@ -233,7 +232,6 @@ async function fetchSolPriceRobust() {
       }
     }
   }
-
   throw lastErr || new Error("All sources failed");
 }
 
@@ -295,9 +293,14 @@ function breakeven() {
 // =====================
 // PAPER EXECUTION
 // =====================
-function placeBuyAtPrice(fillPrice) {
-  const qtySol = ORDER_NOTIONAL_USD / fillPrice;
-  const costUsd = qtySol * fillPrice;
+function recordTrade(t) {
+  trades.unshift(t);
+  trades = trades.slice(0, 10);
+}
+
+function placeBuyAtPrice(fillPrice, costOverrideUsd = null, note = null, isMicroSeed = false) {
+  const costUsd = (costOverrideUsd != null) ? costOverrideUsd : ORDER_NOTIONAL_USD;
+  const qtySol = costUsd / fillPrice;
 
   if (balances.usd < costUsd) return false;
   if (openCount() >= BUY_PACKETS) return false;
@@ -312,13 +315,19 @@ function placeBuyAtPrice(fillPrice) {
     qtySol,
     costUsd,
     openedAt: Date.now(),
+    microSeed: isMicroSeed,
   });
 
   stats.trades++;
   stats.buys++;
 
-  trades.unshift({ ts: Date.now(), side: "BUY", price: fillPrice, qtySol });
-  trades = trades.slice(0, 10);
+  recordTrade({
+    ts: Date.now(),
+    side: "BUY",
+    price: fillPrice,
+    qtySol,
+    note: note || undefined,
+  });
 
   recomputeAvgEntry();
   return true;
@@ -345,11 +354,45 @@ function placeSellAtPrice(fillPrice) {
   stats.trades++;
   stats.sells++;
 
-  trades.unshift({ ts: Date.now(), side: "SELL", price: fillPrice, qtySol, pnlUsd: pnl });
-  trades = trades.slice(0, 10);
+  recordTrade({
+    ts: Date.now(),
+    side: "SELL",
+    price: fillPrice,
+    qtySol,
+    pnlUsd: pnl,
+    note: pos.microSeed ? "CLOSE_MICRO_SEED" : undefined,
+  });
 
   recomputeAvgEntry();
   return true;
+}
+
+/**
+ * ✅ One-time paper micro-seed:
+ * - only if SOL is zero AND no open positions
+ * - uses current price (nowPrice)
+ * - consumes 1 buy packet (intentional: it creates real inventory)
+ */
+function runMicroSeedOnce() {
+  if (MICRO_SEED_USD <= 0) return;
+  if (!Number.isFinite(nowPrice) || !Number.isFinite(anchor)) return;
+
+  // Only seed if we're totally flat (no SOL, no positions).
+  // This makes it run once and never again unless you wipe state.
+  if (balances.sol > 0) return;
+  if (openPositions.length > 0) return;
+
+  const fillPrice = nowPrice * (1 + SIM_SLIPPAGE_PCT);
+  const ok = placeBuyAtPrice(fillPrice, MICRO_SEED_USD, "MICRO_SEED", true);
+
+  if (ok) {
+    console.log(
+      iso(),
+      `MICRO_SEED executed: bought ${(MICRO_SEED_USD / fillPrice).toFixed(6)} SOL @ ${fillPrice.toFixed(2)}`
+    );
+  } else {
+    console.log(iso(), "MICRO_SEED skipped (guard/cash/packets)");
+  }
 }
 
 function simulateFills() {
@@ -407,6 +450,7 @@ function statusObj() {
       BUY_STEP_PCT,
       SELL_STEP_PCT,
       ORDER_NOTIONAL_USD,
+      MICRO_SEED_USD,
       TICK_MS,
     },
 
@@ -509,6 +553,14 @@ function html() {
     .pnl{ font-weight: 900; }
     .pnl.pos{ color: var(--good); }
     .pnl.neg{ color: var(--bad); }
+    .note{
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      margin-left: 6px;
+    }
 
     .ladder{
       display:grid;
@@ -564,7 +616,8 @@ function html() {
 
         <div class="sub">
           Avg entry: <b id="avgEntry">—</b> · Breakeven: <b id="breakeven">—</b><br/>
-          USD: <b id="usd">—</b> · SOL: <b id="sol">—</b> · PV: <b id="pv">—</b>
+          USD: <b id="usd">—</b> · SOL: <b id="sol">—</b> · PV: <b id="pv">—</b><br/>
+          Micro-seed: <b id="seed">—</b>
         </div>
       </div>
 
@@ -620,11 +673,12 @@ function html() {
     const sideClass = t.side === 'BUY' ? 'sidebuy' : 'sidesell';
     const pnl = (typeof t.pnlUsd === 'number') ? t.pnlUsd : null;
     const pnlClass = pnl == null ? '' : (pnl >= 0 ? 'pos' : 'neg');
+    const note = t.note ? \`<span class="note">\${t.note}</span>\` : '';
 
     return \`
       <div class="item">
         <div class="row">
-          <div class="\${sideClass}">\${t.side}</div>
+          <div class="\${sideClass}">\${t.side}\${note}</div>
           <div class="k">\${new Date(t.ts).toLocaleTimeString()}</div>
         </div>
         <div class="row" style="margin-top:6px;">
@@ -661,6 +715,7 @@ function html() {
     document.getElementById('usd').innerText = money(s.balances.usd);
     document.getElementById('sol').innerText = fmt(s.balances.sol, 6);
     document.getElementById('pv').innerText = money(s.stats.portfolioValueUsd);
+    document.getElementById('seed').innerText = (s.config.MICRO_SEED_USD > 0) ? ('$' + s.config.MICRO_SEED_USD.toFixed(0)) : 'OFF';
 
     const matched = (s.stats.sellPackets >= s.stats.openPositions);
     const pill = document.getElementById('matchPill');
@@ -742,15 +797,22 @@ async function tick() {
     lastTickAt = Date.now();
     lastPriceError = "";
 
+    // Init anchor + ladder once
     if (!anchor) {
       anchor = price;
       const { buys, sells } = buildLadder(anchor);
       ladderBuys = buys;
       ladderSells = sells;
+
+      // ✅ micro-seed runs once (if enabled) to create initial inventory
+      runMicroSeedOnce();
+
       console.log(iso(), "INIT", "anchor=", round(anchor, 4), "src=", priceSource);
     }
 
+    // normal fills
     simulateFills();
+
     saveState();
 
     console.log(
