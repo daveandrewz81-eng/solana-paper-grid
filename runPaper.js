@@ -1,3 +1,19 @@
+/**
+ * runPaper.js
+ * -----------
+ * Paper grid bot with:
+ * - Robust SOL price fetch (Jupiter + CoinGecko fallback + optional Birdeye)
+ * - Auto re-anchor (trailing anchor) with guardrails
+ * - Simple paper grid execution (buy/sell “packets”)
+ * - Console table UI
+ *
+ * ✅ Paste this whole file as runPaper.js (replace your existing one).
+ * ✅ Then run: node runPaper.js
+ *
+ * ENV (optional):
+ * - BIRDEYE_API_KEY=xxxx   (only if you want Birdeye)
+ */
+
 import axios from "axios";
 import http from "http";
 import dns from "dns";
@@ -9,698 +25,589 @@ import fs from "fs";
 const TIMEOUT_MS = 15000;
 
 // intervals
-const PRICE_INTERVAL_MS = 30_000;   // price + strategy tick
-const HEARTBEAT_MS = 60_000;        // less spam
-const KEEPALIVE_MS = 60_000;        // uptime robot will do external; this keeps local loop active too
+const PRICE_INTERVAL_MS = 30_000; // price + strategy tick
+const HEARTBEAT_MS = 60_000;      // less spam
+const KEEPALIVE_MS = 60_000;      // keeps local loop active
 
-// grid settings (paper)
-const GRID_STEP_USD = 0.50;         // distance between levels
-const LEVELS_ABOVE = 6;             // sell levels above anchor
-const LEVELS_BELOW = 6;             // buy levels below anchor
+// grid basics
+const GRID_LEVELS_EACH_SIDE = 10;     // number of buys + sells
+const GRID_STEP_PCT = 0.01;           // 1% spacing
+const ORDER_NOTIONAL_USD = 25;        // per packet size (paper)
+const MAX_OPEN_PER_SIDE = 10;         // open orders cap per side
 
-const START_USDC = 500;             // starting paper cash
-const START_SOL = 0;                // starting paper SOL
-const USD_PER_BUY = 25;             // buy size per level in USD
+// paper balances
+const START_USD = 1000;
+const START_SOL = 0;
 
-// PACKETS (capacity / guard)
-const BUY_PACKETS = 6;
-const SELL_PACKETS = 6;
-
-// render web service
-const PORT = process.env.PORT || 10000;
-
-// optional: set this in Render env vars to your public URL
-const SERVICE_URL = process.env.SERVICE_URL || "";
-
-// state file
-const STATE_FILE = "./state.json";
+// slippage simulation (paper only): fill at level price (no slippage by default)
+const SIM_SLIPPAGE_PCT = 0.0;
 
 // =====================
-// DNS hardening
+// AUTO RE-ANCHOR CONFIG
 // =====================
-try {
-  dns.setServers(["1.1.1.1", "8.8.8.8"]);
-  dns.setDefaultResultOrder("ipv4first");
-} catch (_) {}
+const AUTO_REANCHOR_ENABLED = true;
+const REANCHOR_TRIGGER_PCT = 0.04;               // 4%
+const REANCHOR_COOLDOWN_MS = 45 * 60 * 1000;      // 45 min
+const REANCHOR_NO_FILL_WINDOW_MS = 10 * 60 * 1000;// 10 min
+const REANCHOR_MAX_USAGE_PCT = 0.80;              // 80%
 
 // =====================
-// In-memory state (persisted)
+// Price sources
 // =====================
-let state = {
-  anchor: null,
-  step: GRID_STEP_USD,
-  levelsAbove: LEVELS_ABOVE,
-  levelsBelow: LEVELS_BELOW,
+// Jupiter quote (SOL -> USDC)
+const JUP_URL = "https://quote-api.jup.ag/v6/quote";
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-  usdc: START_USDC,
+// CoinGecko (public fallback)
+const CG_URL = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
+
+// Birdeye (optional)
+const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || "";
+const BIRDEYE_URL = "https://public-api.birdeye.so/defi/price?address=So11111111111111111111111111111111111111112";
+
+// =====================
+// State
+// =====================
+let anchorPrice = null;
+let lastReanchorAt = 0;
+let lastFillAt = 0;
+
+let lastPrice = null;
+let lastPriceSource = "N/A";
+
+let openOrders = []; // {id, side:'BUY'|'SELL', price, qtySol, notionalUsd, createdAt}
+let nextOrderId = 1;
+
+let balances = {
+  usd: START_USD,
   sol: START_SOL,
-
-  realizedPnl: 0,
-
-  lastPrice: null,
-  lastAt: null,
-  lastError: null,
-
-  packets: {
-    buyCapacity: BUY_PACKETS,
-    sellCapacity: SELL_PACKETS,
-    note: "Blocks buys that would exceed sell capacity (unmatched positions).",
-  },
-
-  levelStates: {},
-  positions: {},
-
-  trades: [],
-
-  tick: 0,
-  hb: 0,
-
-  realign: {
-    enabled: false,
-    note: "Realignment to be dealt with later",
-    lastSuggestedAt: null,
-    lastSuggestedReason: null,
-  },
+  startUsd: START_USD,
+  startSol: START_SOL,
 };
 
+let stats = {
+  fills: 0,
+  buys: 0,
+  sells: 0,
+  realizedPnlUsd: 0, // simplistic: assumes FIFO by average cost below
+  avgCostUsdPerSol: 0, // moving average cost for SOL position
+};
+
+const STATE_FILE = "./paper_state.json";
+
+// =====================
+// Utilities
+// =====================
+function nowIso() {
+  return new Date().toISOString();
+}
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+function pctDiff(a, b) {
+  if (!a || !b) return 0;
+  return Math.abs(a - b) / b;
+}
+function round(n, dp = 4) {
+  const m = 10 ** dp;
+  return Math.round(n * m) / m;
+}
+function safeNum(n) {
+  return Number.isFinite(n) ? n : 0;
+}
+
+// =====================
+// Persistence (optional)
+// =====================
 function loadState() {
   try {
+    if (!fs.existsSync(STATE_FILE)) return;
     const raw = fs.readFileSync(STATE_FILE, "utf8");
     const s = JSON.parse(raw);
 
-    state = { ...state, ...s };
+    anchorPrice = s.anchorPrice ?? anchorPrice;
+    lastReanchorAt = s.lastReanchorAt ?? lastReanchorAt;
+    lastFillAt = s.lastFillAt ?? lastFillAt;
 
-    state.levelStates ||= {};
-    state.positions ||= {};
-    state.trades ||= [];
-    state.realign ||= { enabled: false };
-    state.packets ||= { buyCapacity: BUY_PACKETS, sellCapacity: SELL_PACKETS };
+    openOrders = Array.isArray(s.openOrders) ? s.openOrders : openOrders;
+    nextOrderId = s.nextOrderId ?? nextOrderId;
 
-    if (!Number.isFinite(state.packets.buyCapacity)) state.packets.buyCapacity = BUY_PACKETS;
-    if (!Number.isFinite(state.packets.sellCapacity)) state.packets.sellCapacity = SELL_PACKETS;
+    balances = s.balances ?? balances;
+    stats = s.stats ?? stats;
 
-    console.log(
-      `RESTORED_STATE anchor=${state.anchor ?? "n/a"} usdc=${state.usdc} sol=${state.sol} tick=${state.tick} trades=${state.trades.length}`
-    );
-  } catch (_) {
-    console.log("NO_STATE_FOUND - starting fresh");
+    console.log(nowIso(), "STATE_LOADED");
+  } catch (e) {
+    console.log(nowIso(), "STATE_LOAD_FAILED", e?.message || e);
   }
 }
 
 function saveState() {
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+    const s = {
+      anchorPrice,
+      lastReanchorAt,
+      lastFillAt,
+      openOrders,
+      nextOrderId,
+      balances,
+      stats,
+      lastPrice,
+      lastPriceSource,
+      savedAt: Date.now(),
+    };
+    fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
   } catch (e) {
-    console.log("STATE_SAVE_FAILED", String(e?.message || e));
+    console.log(nowIso(), "STATE_SAVE_FAILED", e?.message || e);
   }
-}
-
-function clampTrades() {
-  if (state.trades.length > 100) state.trades = state.trades.slice(-100);
-}
-
-function round2(x) {
-  return Math.round(x * 100) / 100;
-}
-
-function fmt2(x) {
-  return Number(x).toFixed(2);
-}
-
-function levelKey(side, price) {
-  return `${side}:${fmt2(price)}`;
-}
-
-function buildLevels(anchor) {
-  const step = state.step;
-
-  const sells = [];
-  for (let i = state.levelsAbove; i >= 1; i--) {
-    sells.push(round2(anchor + step * i));
-  }
-
-  const buys = [];
-  for (let i = 1; i <= state.levelsBelow; i++) {
-    buys.push(round2(anchor - step * i));
-  }
-
-  return { sells, buys };
 }
 
 // =====================
-// P/L helpers
+// Network helpers
 // =====================
-function computeUnrealizedPnl(currentPrice) {
-  let u = 0;
-  for (const k of Object.keys(state.positions)) {
-    const pos = state.positions[k];
-    u += (currentPrice - pos.entryPrice) * pos.qtySol;
-  }
-  return round2(u);
+function ensureDnsOnce() {
+  // Avoid rare ENOTFOUND flakiness by forcing a DNS resolve early.
+  return new Promise((resolve) => {
+    dns.lookup("quote-api.jup.ag", () => resolve());
+  });
 }
 
-function computeAverageEntry() {
-  let totalQty = 0;
-  let totalCost = 0;
+function makeAxios() {
+  return axios.create({
+    timeout: TIMEOUT_MS,
+    headers: {
+      "User-Agent": "sol-paper-grid/1.0",
+      Accept: "application/json",
+    },
+  });
+}
 
-  for (const k of Object.keys(state.positions)) {
-    const pos = state.positions[k];
-    totalQty += pos.qtySol;
-    totalCost += pos.qtySol * pos.entryPrice;
+const ax = makeAxios();
+
+// =====================
+// Price fetchers
+// =====================
+async function fetchPriceFromJupiter() {
+  // 1 SOL = 1e9 lamports
+  const inAmount = "1000000000";
+  const params = {
+    inputMint: SOL_MINT,
+    outputMint: USDC_MINT,
+    inAmount,
+    swapMode: "ExactIn",
+    slippageBps: 50,
+  };
+
+  const r = await ax.get(JUP_URL, { params });
+  const data = r?.data;
+  const outAmount = Number(data?.outAmount); // USDC has 6 decimals
+  if (!Number.isFinite(outAmount) || outAmount <= 0) {
+    throw new Error("Bad outAmount from Jupiter");
   }
+  const usd = outAmount / 1e6;
+  return usd;
+}
 
-  if (totalQty === 0) return null;
-  return round2(totalCost / totalQty);
+async function fetchPriceFromCoinGecko() {
+  const r = await ax.get(CG_URL);
+  const usd = Number(r?.data?.solana?.usd);
+  if (!Number.isFinite(usd) || usd <= 0) throw new Error("Bad CoinGecko price");
+  return usd;
+}
+
+async function fetchPriceFromBirdeye() {
+  if (!BIRDEYE_API_KEY) throw new Error("No Birdeye API key set");
+  const r = await ax.get(BIRDEYE_URL, {
+    headers: { "X-API-KEY": BIRDEYE_API_KEY },
+  });
+  const usd = Number(r?.data?.data?.value);
+  if (!Number.isFinite(usd) || usd <= 0) throw new Error("Bad Birdeye price");
+  return usd;
+}
+
+async function fetchSolPrice() {
+  // Try Jupiter, then CoinGecko, then Birdeye (or swap Birdeye before CG if you prefer)
+  const attempts = [
+    { name: "JUP", fn: fetchPriceFromJupiter },
+    { name: "CG", fn: fetchPriceFromCoinGecko },
+    ...(BIRDEYE_API_KEY ? [{ name: "BIRDEYE", fn: fetchPriceFromBirdeye }] : []),
+  ];
+
+  let lastErr = null;
+  for (const a of attempts) {
+    try {
+      const p = await a.fn();
+      return { price: p, source: a.name };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("All price sources failed");
 }
 
 // =====================
-// PACKET / POSITION STATS
+// Grid building
 // =====================
-function computeStats(currentPrice = null) {
-  const trades = Array.isArray(state.trades) ? state.trades : [];
+function buildGrid(anchor) {
+  // Build symmetric levels around anchor:
+  // BUY: anchor*(1 - step*i), SELL: anchor*(1 + step*i), i=1..N
+  const levels = [];
+  for (let i = 1; i <= GRID_LEVELS_EACH_SIDE; i++) {
+    levels.push({ side: "BUY", price: anchor * (1 - GRID_STEP_PCT * i) });
+    levels.push({ side: "SELL", price: anchor * (1 + GRID_STEP_PCT * i) });
+  }
+  // Sort buys descending (closest first), sells ascending (closest first)
+  const buys = levels.filter(l => l.side === "BUY").sort((a,b) => b.price - a.price);
+  const sells = levels.filter(l => l.side === "SELL").sort((a,b) => a.price - b.price);
+  return { buys, sells };
+}
 
-  const buysFilled = trades.filter((t) => t.side === "BUY").length;
-  const sellsFilled = trades.filter((t) => t.side === "SELL").length;
+function getUsagePct() {
+  // % of open orders used on each side relative to max
+  const buysOpen = openOrders.filter(o => o.side === "BUY").length;
+  const sellsOpen = openOrders.filter(o => o.side === "SELL").length;
+  return {
+    buysUsedPct: clamp(buysOpen / Math.max(1, MAX_OPEN_PER_SIDE), 0, 1),
+    sellsUsedPct: clamp(sellsOpen / Math.max(1, MAX_OPEN_PER_SIDE), 0, 1),
+  };
+}
 
-  const openPositions = Math.max(0, buysFilled - sellsFilled);
+function clearOpenOrders() {
+  openOrders = [];
+}
 
-  const buyCapacity = Number(state.packets?.buyCapacity || 0);
-  const sellCapacity = Number(state.packets?.sellCapacity || 0);
+function seedOpenOrdersFromGrid(anchor) {
+  const { buys, sells } = buildGrid(anchor);
 
-  const unmatchedPositions = Math.max(0, openPositions - sellCapacity);
+  // Keep up to MAX_OPEN_PER_SIDE per side
+  const wantBuys = buys.slice(0, MAX_OPEN_PER_SIDE);
+  const wantSells = sells.slice(0, MAX_OPEN_PER_SIDE);
 
-  const unrealized = currentPrice != null ? computeUnrealizedPnl(currentPrice) : 0;
-  const totalPnl = round2(state.realizedPnl + unrealized);
+  const newOrders = [];
+
+  for (const lvl of wantBuys) {
+    newOrders.push(makeOrder("BUY", lvl.price));
+  }
+  for (const lvl of wantSells) {
+    newOrders.push(makeOrder("SELL", lvl.price));
+  }
+
+  openOrders = newOrders;
+}
+
+function makeOrder(side, price) {
+  // notional USD fixed; qtySol = usd / price
+  const notionalUsd = ORDER_NOTIONAL_USD;
+  const qtySol = notionalUsd / price;
 
   return {
-    totalTrades: trades.length,
-    buysFilled,
-    sellsFilled,
-    openPositions,
-    unmatchedPositions,
-    buyCapacity,
-    sellCapacity,
-    pnl: {
-      realized: round2(state.realizedPnl),
-      unrealized,
-      total: totalPnl,
-    },
+    id: nextOrderId++,
+    side,
+    price,
+    qtySol,
+    notionalUsd,
+    createdAt: Date.now(),
   };
 }
 
-function canPlaceAnotherBuy() {
-  const stats = computeStats(state.lastPrice);
-  return stats.openPositions + 1 <= stats.sellCapacity;
-}
-
-function ensureGridInitialized(price) {
-  if (state.anchor != null) return;
-
-  const step = state.step;
-  const anchor = round2(Math.round(price / step) * step);
-  state.anchor = anchor;
-
-  const { sells, buys } = buildLevels(anchor);
-
-  for (const p of sells) state.levelStates[levelKey("S", p)] ||= "WAIT";
-  for (const p of buys) state.levelStates[levelKey("B", p)] ||= "WAIT";
-
-  saveState();
-  console.log(`GRID_INIT anchor=${fmt2(anchor)} step=${fmt2(step)} sells=${sells.length} buys=${buys.length}`);
-}
-
 // =====================
-// Price fetch
+// Auto re-anchor logic
 // =====================
-async function priceFromCoinbase() {
-  const res = await axios.get("https://api.coinbase.com/v2/prices/SOL-USD/spot", {
-    timeout: TIMEOUT_MS,
-  });
-  const price = Number(res?.data?.data?.amount);
-  if (!Number.isFinite(price)) throw new Error("Coinbase bad price");
-  return price;
+function shouldReanchor({
+  now,
+  currentPrice,
+  anchorPrice,
+  lastReanchorAt,
+  lastFillAt,
+  buysUsedPct,
+  sellsUsedPct,
+}) {
+  if (!AUTO_REANCHOR_ENABLED) return { ok: false, reason: "disabled" };
+  if (!anchorPrice || !Number.isFinite(anchorPrice)) return { ok: false, reason: "no_anchor" };
+  if (!currentPrice || !Number.isFinite(currentPrice)) return { ok: false, reason: "bad_price" };
+
+  const drift = pctDiff(currentPrice, anchorPrice);
+  if (drift < REANCHOR_TRIGGER_PCT) return { ok: false, reason: "drift_small", drift };
+
+  if (now - lastReanchorAt < REANCHOR_COOLDOWN_MS) {
+    return { ok: false, reason: "cooldown", drift };
+  }
+
+  if (now - lastFillAt < REANCHOR_NO_FILL_WINDOW_MS) {
+    return { ok: false, reason: "recent_fill", drift };
+  }
+
+  if (buysUsedPct >= REANCHOR_MAX_USAGE_PCT || sellsUsedPct >= REANCHOR_MAX_USAGE_PCT) {
+    return { ok: false, reason: "usage_high", drift, buysUsedPct, sellsUsedPct };
+  }
+
+  return { ok: true, reason: "reanchor", drift };
 }
 
-// =====================
-// Strategy (paper grid)
-// =====================
-function markHits(currentPrice) {
-  if (state.anchor == null) return;
+function reanchorGrid(currentPrice) {
+  anchorPrice = currentPrice;
+  lastReanchorAt = Date.now();
 
-  const { sells, buys } = buildLevels(state.anchor);
-
-  for (const p of sells) {
-    const k = levelKey("S", p);
-    if ((state.levelStates[k] || "WAIT") === "WAIT" && currentPrice >= p) state.levelStates[k] = "HIT";
-  }
-
-  for (const p of buys) {
-    const k = levelKey("B", p);
-    if ((state.levelStates[k] || "WAIT") === "WAIT" && currentPrice <= p) state.levelStates[k] = "HIT";
-  }
-}
-
-function tryExecuteBuys(currentPrice) {
-  if (state.anchor == null) return;
-
-  const { buys } = buildLevels(state.anchor);
-
-  for (const p of buys) {
-    const k = levelKey("B", p);
-    const st = state.levelStates[k] || "WAIT";
-
-    if ((st === "HIT" || st === "WAIT") && currentPrice <= p) {
-      if (state.positions[k]) {
-        state.levelStates[k] = "FILLED";
-        continue;
-      }
-
-      if (!canPlaceAnotherBuy()) {
-        state.levelStates[k] = "HIT";
-        state.lastError = `BUY_BLOCKED: sell packets exhausted (sellCapacity=${state.packets.sellCapacity}).`;
-        const s = computeStats(currentPrice);
-        console.log(`[GUARD] BUY blocked at L${fmt2(p)} | open=${s.openPositions} sellCap=${s.sellCapacity}`);
-        return;
-      }
-
-      const usd = USD_PER_BUY;
-      if (state.usdc < usd) continue;
-
-      const qtySol = usd / currentPrice;
-
-      state.usdc = round2(state.usdc - usd);
-      state.sol = state.sol + qtySol;
-
-      state.positions[k] = { qtySol, entryPrice: currentPrice, openedAt: new Date().toISOString() };
-      state.levelStates[k] = "FILLED";
-
-      const trade = {
-        id: `T${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-        side: "BUY",
-        level: fmt2(p),
-        price: round2(currentPrice),
-        qtySol: qtySol,
-        pnl: 0,
-        at: new Date().toISOString(),
-      };
-      state.trades.push(trade);
-      clampTrades();
-
-      state.lastError = null;
-
-      console.log(
-        `BUY  level=${trade.level} price=${fmt2(trade.price)} qtySol=${trade.qtySol.toFixed(6)} usdc=${fmt2(state.usdc)} sol=${state.sol.toFixed(6)}`
-      );
-    }
-  }
-}
-
-function tryExecuteSells(currentPrice) {
-  if (state.anchor == null) return;
-
-  const { sells } = buildLevels(state.anchor);
-  const reached = sells.filter((p) => currentPrice >= p);
-  if (reached.length === 0) return;
-
-  const sellLevel = Math.min(...reached);
-  const sellKey = levelKey("S", sellLevel);
-  if ((state.levelStates[sellKey] || "WAIT") === "WAIT") state.levelStates[sellKey] = "HIT";
-
-  const openKeys = Object.keys(state.positions);
-  if (openKeys.length === 0) return;
-
-  const buyTrades = state.trades.filter((t) => t.side === "BUY");
-  let posKey = null;
-
-  for (const t of buyTrades) {
-    const k = levelKey("B", Number(t.level));
-    if (state.positions[k]) {
-      posKey = k;
-      break;
-    }
-  }
-  if (!posKey) posKey = openKeys[0];
-
-  const pos = state.positions[posKey];
-  if (!pos) return;
-
-  const qtySol = pos.qtySol;
-
-  if (state.sol + 1e-12 < qtySol) {
-    state.lastError = "Not enough SOL to sell (paper mismatch)";
-    return;
-  }
-
-  const usdProceeds = qtySol * currentPrice;
-
-  state.sol = state.sol - qtySol;
-  state.usdc = round2(state.usdc + usdProceeds);
-
-  const pnl = (currentPrice - pos.entryPrice) * qtySol;
-  state.realizedPnl = round2(state.realizedPnl + pnl);
-
-  delete state.positions[posKey];
-
-  const trade = {
-    id: `T${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-    side: "SELL",
-    level: fmt2(sellLevel),
-    price: round2(currentPrice),
-    qtySol: qtySol,
-    pnl: round2(pnl),
-    at: new Date().toISOString(),
-  };
-  state.trades.push(trade);
-  clampTrades();
-
-  state.levelStates[sellKey] = "FILLED";
-  state.lastError = null;
+  clearOpenOrders();
+  seedOpenOrdersFromGrid(anchorPrice);
 
   console.log(
-    `SELL level=${trade.level} price=${fmt2(trade.price)} qtySol=${trade.qtySol.toFixed(6)} pnl=${fmt2(trade.pnl)} usdc=${fmt2(state.usdc)} sol=${state.sol.toFixed(6)}`
+    nowIso(),
+    `AUTO_REANCHOR: new_anchor=${round(anchorPrice, 4)}`
   );
 }
 
 // =====================
-// Realignment placeholder
+// Paper fills
 // =====================
-function maybeSuggestRealignment(currentPrice) {
-  if (state.anchor == null) return;
+function tryFillOrders(currentPrice) {
+  // Fill rules:
+  // - BUY fills if currentPrice <= order.price
+  // - SELL fills if currentPrice >= order.price
+  // Fill in “best first” order to simulate realistic behaviour
+  const buys = openOrders
+    .filter(o => o.side === "BUY")
+    .sort((a, b) => b.price - a.price); // highest buy first
+  const sells = openOrders
+    .filter(o => o.side === "SELL")
+    .sort((a, b) => a.price - b.price); // lowest sell first
 
-  const rangeTop = state.anchor + state.step * state.levelsAbove;
-  const rangeBot = state.anchor - state.step * state.levelsBelow;
+  const filledIds = new Set();
 
-  const outOfRange = currentPrice > rangeTop || currentPrice < rangeBot;
-  if (!outOfRange) return;
+  // BUY fills
+  for (const o of buys) {
+    if (currentPrice > o.price) continue;
 
-  const now = Date.now();
-  const last = state.realign?.lastSuggestedAt ? Date.parse(state.realign.lastSuggestedAt) : 0;
-  if (now - last < 15 * 60 * 1000) return;
+    const fillPrice = o.price * (1 + SIM_SLIPPAGE_PCT);
+    const costUsd = o.qtySol * fillPrice;
 
-  state.realign.lastSuggestedAt = new Date().toISOString();
-  state.realign.lastSuggestedReason = `Price ${fmt2(currentPrice)} out of ladder range (${fmt2(rangeBot)}–${fmt2(rangeTop)}). Realignment TBD.`;
+    if (balances.usd >= costUsd) {
+      balances.usd -= costUsd;
+      balances.sol += o.qtySol;
 
-  console.log("REALIGN_SUGGESTED", state.realign.lastSuggestedReason);
+      // Update avg cost
+      const prevSol = balances.sol - o.qtySol;
+      const prevCost = stats.avgCostUsdPerSol * prevSol;
+      const newCost = prevCost + costUsd;
+      stats.avgCostUsdPerSol = balances.sol > 0 ? newCost / balances.sol : 0;
+
+      stats.fills++;
+      stats.buys++;
+      lastFillAt = Date.now();
+      filledIds.add(o.id);
+
+      console.log(nowIso(), `FILL BUY  id=${o.id} price=${round(fillPrice, 4)} qty=${round(o.qtySol, 6)}`);
+    }
+  }
+
+  // SELL fills
+  for (const o of sells) {
+    if (currentPrice < o.price) continue;
+
+    const fillPrice = o.price * (1 - SIM_SLIPPAGE_PCT);
+    const qty = o.qtySol;
+
+    if (balances.sol >= qty) {
+      balances.sol -= qty;
+      const proceedsUsd = qty * fillPrice;
+      balances.usd += proceedsUsd;
+
+      // Realized pnl vs avg cost
+      const costBasis = qty * stats.avgCostUsdPerSol;
+      const pnl = proceedsUsd - costBasis;
+      stats.realizedPnlUsd += pnl;
+
+      // avg cost remains for remaining sol (moving avg approximation)
+      if (balances.sol <= 0) stats.avgCostUsdPerSol = 0;
+
+      stats.fills++;
+      stats.sells++;
+      lastFillAt = Date.now();
+      filledIds.add(o.id);
+
+      console.log(nowIso(), `FILL SELL id=${o.id} price=${round(fillPrice, 4)} qty=${round(qty, 6)} pnl=${round(pnl, 2)}`);
+    }
+  }
+
+  if (filledIds.size > 0) {
+    openOrders = openOrders.filter(o => !filledIds.has(o.id));
+    // Replenish orders to keep grid topped up
+    topUpOrders();
+  }
+}
+
+function topUpOrders() {
+  if (!anchorPrice) return;
+
+  const { buys, sells } = buildGrid(anchorPrice);
+
+  const buysOpen = openOrders.filter(o => o.side === "BUY");
+  const sellsOpen = openOrders.filter(o => o.side === "SELL");
+
+  // Prices already covered (avoid duplicates)
+  const openBuyPrices = new Set(buysOpen.map(o => round(o.price, 6)));
+  const openSellPrices = new Set(sellsOpen.map(o => round(o.price, 6)));
+
+  // Add missing buys up to cap
+  for (const lvl of buys) {
+    if (buysOpen.length >= MAX_OPEN_PER_SIDE) break;
+    const p = round(lvl.price, 6);
+    if (openBuyPrices.has(p)) continue;
+    openOrders.push(makeOrder("BUY", lvl.price));
+    buysOpen.push(openOrders[openOrders.length - 1]);
+    openBuyPrices.add(p);
+  }
+
+  // Add missing sells up to cap
+  for (const lvl of sells) {
+    if (sellsOpen.length >= MAX_OPEN_PER_SIDE) break;
+    const p = round(lvl.price, 6);
+    if (openSellPrices.has(p)) continue;
+    openOrders.push(makeOrder("SELL", lvl.price));
+    sellsOpen.push(openOrders[openOrders.length - 1]);
+    openSellPrices.add(p);
+  }
 }
 
 // =====================
-// Dashboard
+// UI / reporting
 // =====================
-function htmlEscape(s) {
-  return String(s).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+function portfolioValueUsd(markPrice) {
+  return balances.usd + balances.sol * markPrice;
 }
 
-function renderDashboard() {
-  const p = state.lastPrice;
-  const anchor = state.anchor;
-  const { sells, buys } = anchor != null ? buildLevels(anchor) : { sells: [], buys: [] };
+function printStatus(markPrice) {
+  const pv = portfolioValueUsd(markPrice);
+  const startPv = balances.startUsd + balances.startSol * markPrice;
+  const unrealized = pv - (balances.usd + balances.sol * stats.avgCostUsdPerSol); // rough
+  const totalPnl = pv - startPv;
 
-  const stats = computeStats(p);
-  const avgEntry = computeAverageEntry();
-  const breakeven = avgEntry;
+  const { buysUsedPct, sellsUsedPct } = getUsagePct();
+
+  const buys = openOrders.filter(o => o.side === "BUY").sort((a,b) => b.price - a.price);
+  const sells = openOrders.filter(o => o.side === "SELL").sort((a,b) => a.price - b.price);
 
   const rows = [];
 
-  for (const sp of sells) {
-    const k = levelKey("S", sp);
-    const st = state.levelStates[k] || "WAIT";
-    rows.push({ type: "SELL", price: sp, state: st });
+  const maxRows = Math.max(buys.length, sells.length, 8);
+  for (let i = 0; i < maxRows; i++) {
+    const b = buys[i];
+    const s = sells[i];
+    rows.push({
+      BUY_price: b ? round(b.price, 4) : "",
+      BUY_qty: b ? round(b.qtySol, 6) : "",
+      SOL_price: i === 0 ? round(markPrice, 4) : "",
+      SELL_price: s ? round(s.price, 4) : "",
+      SELL_qty: s ? round(s.qtySol, 6) : "",
+    });
   }
 
-  rows.push({ type: "NOW", price: p, state: "NOW" });
+  console.log("\n" + nowIso(), `PRICE=${round(markPrice, 4)} src=${lastPriceSource} anchor=${anchorPrice ? round(anchorPrice, 4) : "N/A"}`);
+  console.log(`Bal: USD=${round(balances.usd, 2)} SOL=${round(balances.sol, 6)}  PV=$${round(pv, 2)}  TotalPnL=$${round(totalPnl, 2)}`);
+  console.log(`Fills=${stats.fills} (buys=${stats.buys}, sells=${stats.sells})  RealizedPnL=$${round(stats.realizedPnlUsd, 2)} AvgCost=$${round(stats.avgCostUsdPerSol, 4)}`);
+  console.log(`OpenOrders: BUY=${buys.length}/${MAX_OPEN_PER_SIDE} SELL=${sells.length}/${MAX_OPEN_PER_SIDE} usage(b/s)=${Math.round(buysUsedPct*100)}%/${Math.round(sellsUsedPct*100)}%`);
 
-  for (const bp of buys) {
-    const k = levelKey("B", bp);
-    const st = state.levelStates[k] || "WAIT";
-    rows.push({ type: "BUY", price: bp, state: st });
-  }
-
-  const lastTrades = state.trades.slice(-10).reverse();
-
-  const css = `
-    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b0f14;color:#e8eef6}
-    .wrap{max-width:560px;margin:0 auto;padding:14px}
-    .card{background:#121a23;border:1px solid #1f2a36;border-radius:14px;padding:12px}
-    .label{opacity:.75;font-size:12px}
-    .val{font-size:18px;font-weight:700;margin-top:2px}
-    .muted{opacity:.7;font-size:12px;margin-top:4px}
-
-    .banner{border-radius:16px;padding:12px 12px;margin-bottom:12px;border:1px solid #1f2a36;background:#0f141b}
-    .banner.ok{border-color:rgba(80,255,140,.28);background:rgba(80,255,140,.07)}
-    .banner.warn{border-color:rgba(255,80,80,.35);background:rgba(255,80,80,.10)}
-    .bigline{font-size:16px;font-weight:900}
-    .pillrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-    .pill{font-size:12px;opacity:.9;border:1px solid #2b3442;border-radius:999px;padding:4px 10px;background:rgba(255,255,255,.04)}
-
-    .top{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
-
-    .row{display:flex;align-items:center;justify-content:space-between;border-radius:14px;padding:12px 14px;margin:8px 0;border:1px solid #1f2a36;background:#101720}
-    .row .left{font-weight:900}
-    .row .right{font-weight:900;font-size:20px}
-
-    .SELL{background:#1a0f12;border-color:#3a1f24}
-    .BUY{background:#0f1a13;border-color:#1f3a28}
-    .NOW{background:#161b22;border-color:#2b3442}
-
-    .HIT{outline:2px solid rgba(255,255,255,.18)}
-    .FILLED{box-shadow:0 0 0 2px rgba(255,255,255,.12) inset}
-
-    .badge{font-size:11px;opacity:.8;border:1px solid #2b3442;border-radius:999px;padding:2px 8px}
-
-    .trade{display:flex;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:14px;border:1px solid #1f2a36;background:#0f141b;margin:8px 0}
-    .trade .a{font-weight:900}
-    .trade .b{opacity:.8}
-  `;
-
-  const bannerClass = stats.unmatchedPositions > 0 ? "banner warn" : "banner ok";
-  const bannerTitle = stats.unmatchedPositions > 0
-    ? `⚠ Unmatched positions: ${stats.unmatchedPositions}`
-    : `✅ Matched: sells can cover open positions`;
-
-  const bannerHtml = `
-    <div class="${bannerClass}">
-      <div class="bigline">${bannerTitle}</div>
-      <div class="muted" style="margin-top:6px">
-        Trades ${stats.totalTrades} • Buys ${stats.buysFilled} • Sells ${stats.sellsFilled}
-      </div>
-      <div class="pillrow">
-        <div class="pill">Open positions: <b>${stats.openPositions}</b></div>
-        <div class="pill">Sell packets: <b>${stats.sellCapacity}</b></div>
-        <div class="pill">Buy packets: <b>${stats.buyCapacity}</b></div>
-        <div class="pill">Guard: blocks BUY when open+1 &gt; sell packets</div>
-      </div>
-      ${
-        avgEntry
-          ? `<div class="muted" style="margin-top:8px">Avg entry ${fmt2(avgEntry)} • Breakeven ${fmt2(breakeven)}</div>`
-          : `<div class="muted" style="margin-top:8px">Avg entry — • Breakeven —</div>`
-      }
-      ${state.lastError ? `<div class="muted" style="margin-top:8px">Last error: ${htmlEscape(state.lastError)}</div>` : ``}
-    </div>
-  `;
-
-  const ladderHtml = rows
-    .map((r) => {
-      if (r.type === "NOW") {
-        const nowPrice = p != null ? fmt2(p) : "—";
-        const updated = state.lastAt ? new Date(state.lastAt).toLocaleTimeString("en-GB") : "—";
-        return `
-          <div class="row NOW">
-            <div>
-              <div class="left">NOW <span class="badge">RUNNING</span></div>
-              <div class="muted">Updated: ${htmlEscape(updated)}</div>
-              <div class="muted">Anchor: ${anchor != null ? fmt2(anchor) : "—"} • Step: ${fmt2(state.step)}</div>
-            </div>
-            <div class="right">${htmlEscape(nowPrice)}</div>
-          </div>
-        `;
-      }
-
-      const cls = `${r.type} ${r.state === "HIT" ? "HIT" : ""} ${r.state === "FILLED" ? "FILLED" : ""}`;
-      const badge =
-        r.state === "FILLED" ? `<span class="badge">FILLED</span>` :
-        r.state === "HIT" ? `<span class="badge">HIT</span>` :
-        `<span class="badge">WAIT</span>`;
-
-      return `
-        <div class="row ${cls}">
-          <div class="left">${r.type} ${badge}</div>
-          <div class="right">${fmt2(r.price)}</div>
-        </div>
-      `;
-    })
-    .join("");
-
-  const tradesHtml = lastTrades
-    .map((t) => {
-      const pnlTxt = t.side === "SELL" ? `PnL ${fmt2(t.pnl)}` : "";
-      const time = new Date(t.at).toLocaleTimeString("en-GB");
-      return `
-        <div class="trade">
-          <div>
-            <div class="a">${htmlEscape(t.side)} @ ${fmt2(t.price)} <span class="badge">L${htmlEscape(t.level)}</span></div>
-            <div class="b">${htmlEscape(time)} • qty ${t.qtySol.toFixed(6)} ${pnlTxt ? "• " + htmlEscape(pnlTxt) : ""}</div>
-          </div>
-          <div class="b">#${htmlEscape(t.id)}</div>
-        </div>
-      `;
-    })
-    .join("");
-
-  return `
-    <!doctype html>
-    <html>
-    <head>
-      <meta charset="utf-8"/>
-      <meta name="viewport" content="width=device-width, initial-scale=1"/>
-      <meta http-equiv="refresh" content="5">
-      <title>Grid Bot</title>
-      <style>${css}</style>
-    </head>
-    <body>
-      <div class="wrap">
-        ${bannerHtml}
-
-        <div class="top">
-          <div class="card">
-            <div class="label">Balances</div>
-            <div class="val">USDC ${fmt2(state.usdc)}</div>
-            <div class="val">SOL ${state.sol.toFixed(6)}</div>
-          </div>
-          <div class="card">
-            <div class="label">P/L</div>
-            <div class="val">Realized ${fmt2(stats.pnl.realized)}</div>
-            <div class="val">Unrealized ${fmt2(stats.pnl.unrealized)}</div>
-            <div class="muted">Total ${fmt2(stats.pnl.total)}</div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="label">Ladder (fixed levels; colour/state changes)</div>
-          <div class="muted">${htmlEscape(state.realign?.note || "")}${state.realign?.lastSuggestedReason ? " • " + htmlEscape(state.realign.lastSuggestedReason) : ""}</div>
-          <div class="ladder">
-            ${ladderHtml}
-          </div>
-        </div>
-
-        <div class="card" style="margin-top:12px">
-          <div class="label">Last 10 trades</div>
-          ${tradesHtml || `<div class="muted">No trades yet.</div>`}
-        </div>
-      </div>
-    </body>
-    </html>
-  `;
-}
-
-function getStatus() {
-  const p = state.lastPrice;
-  const stats = computeStats(p);
-  const avgEntry = computeAverageEntry();
-  const breakeven = avgEntry;
-
-  return {
-    now: new Date().toISOString(),
-    lastPrice: state.lastPrice,
-    lastAt: state.lastAt,
-    anchor: state.anchor,
-    step: state.step,
-    balances: { usdc: state.usdc, sol: state.sol },
-    pnl: stats.pnl,
-    avgEntry,
-    breakeven,
-    packets: {
-      buyCapacity: stats.buyCapacity,
-      sellCapacity: stats.sellCapacity,
-      openPositions: stats.openPositions,
-      unmatchedPositions: stats.unmatchedPositions,
-      guardAllowsBuy: canPlaceAnotherBuy(),
-    },
-    tick: state.tick,
-    hb: state.hb,
-    trades: state.trades.slice(-20),
-    realign: state.realign,
-    lastError: state.lastError,
-  };
-}
-
-// =====================
-// HTTP server
-// =====================
-http
-  .createServer((req, res) => {
-    if (req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      return res.end("OK");
-    }
-
-    if (req.url === "/status") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify(getStatus(), null, 2));
-    }
-
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    return res.end(renderDashboard());
-  })
-  .listen(PORT, "0.0.0.0", () => {
-    console.log(`HTTP_LISTENING ${PORT}`);
-  });
-
-// =====================
-// Keepalive
-// =====================
-async function keepAlive() {
-  try {
-    await axios.get(`http://127.0.0.1:${PORT}/health`, { timeout: 5000 });
-    if (SERVICE_URL) await axios.get(`${SERVICE_URL}/health`, { timeout: 8000 });
-    console.log("KEEPALIVE ok");
-  } catch (err) {
-    console.log(`KEEPALIVE_FAILED | ${err?.message || err}`);
-  }
-}
-
-// =====================
-// Main loops
-// =====================
-async function tick() {
-  state.tick += 1;
-
-  try {
-    const price = await priceFromCoinbase();
-
-    state.lastPrice = round2(price);
-    state.lastAt = new Date().toISOString();
-    state.lastError = null;
-
-    ensureGridInitialized(state.lastPrice);
-
-    markHits(state.lastPrice);
-    tryExecuteBuys(state.lastPrice);
-    tryExecuteSells(state.lastPrice);
-
-    maybeSuggestRealignment(state.lastPrice);
-
-    saveState();
-
-    console.log(`PRICE ${fmt2(state.lastPrice)} | TICK ${state.tick} | coinbase`);
-  } catch (err) {
-    state.lastError = err?.message || String(err);
-    console.log(`PRICE_FETCH_FAILED | ${state.lastError}`);
-    saveState();
-  }
+  console.table(rows);
 }
 
 function heartbeat() {
-  state.hb += 1;
-  console.log(`HEARTBEAT ${state.hb}`);
-  if (state.hb % 5 === 0) saveState();
+  console.log(nowIso(), "HEARTBEAT", `price=${lastPrice ? round(lastPrice, 4) : "N/A"} openOrders=${openOrders.length}`);
 }
 
-process.on("unhandledRejection", (e) => console.log("UNHANDLED_REJECTION", String(e)));
-process.on("uncaughtException", (e) => console.log("UNCAUGHT_EXCEPTION", String(e)));
+// =====================
+// Keepalive server (optional)
+// =====================
+function startKeepAliveServer() {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("OK\n");
+  });
+  server.listen(0, () => {
+    const addr = server.address();
+    console.log(nowIso(), `KEEPALIVE listening on port ${addr.port}`);
+  });
+}
 
-loadState();
-heartbeat();
-tick();
-setInterval(heartbeat, HEARTBEAT_MS);
-setInterval(tick, PRICE_INTERVAL_MS);
-setInterval(keepAlive, KEEPALIVE_MS);
+// =====================
+// Main loop
+// =====================
+async function priceAndStrategyTick() {
+  try {
+    const { price, source } = await fetchSolPrice();
+    lastPrice = price;
+    lastPriceSource = source;
+
+    // Initialize anchor + grid once
+    if (!anchorPrice) {
+      anchorPrice = price;
+      clearOpenOrders();
+      seedOpenOrdersFromGrid(anchorPrice);
+      console.log(nowIso(), `INIT anchor=${round(anchorPrice, 4)}`);
+    }
+
+    // Auto re-anchor check
+    const { buysUsedPct, sellsUsedPct } = getUsagePct();
+    const decision = shouldReanchor({
+      now: Date.now(),
+      currentPrice: price,
+      anchorPrice,
+      lastReanchorAt,
+      lastFillAt,
+      buysUsedPct,
+      sellsUsedPct,
+    });
+
+    if (decision.ok) {
+      console.log(nowIso(), `AUTO_REANCHOR_TRIGGER drift=${round(decision.drift * 100, 2)}%`);
+      reanchorGrid(price);
+      // After reanchor, skip fills this tick (optional safety)
+      printStatus(price);
+      saveState();
+      return;
+    }
+
+    // Try fills, then show status
+    tryFillOrders(price);
+    printStatus(price);
+
+    saveState();
+  } catch (e) {
+    console.log(nowIso(), "PRICE_FETCH_FAILED", e?.message || e);
+  }
+}
+
+// =====================
+// Boot
+// =====================
+async function main() {
+  console.log("Paper bot started");
+  loadState();
+
+  await ensureDnsOnce();
+
+  startKeepAliveServer();
+
+  // First tick immediately
+  await priceAndStrategyTick();
+
+  // Strategy tick
+  setInterval(() => {
+    priceAndStrategyTick().catch(() => {});
+  }, PRICE_INTERVAL_MS);
+
+  // Heartbeat
+  setInterval(() => {
+    heartbeat();
+  }, HEARTBEAT_MS);
+
+  // Keepalive no-op
+  setInterval(() => {}, KEEPALIVE_MS);
+}
+
+main().catch((e) => {
+  console.log(nowIso(), "FATAL", e?.message || e);
+  process.exit(1);
+});
