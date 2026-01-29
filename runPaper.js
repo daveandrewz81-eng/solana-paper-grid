@@ -22,10 +22,15 @@ const START_USDC = 500;             // starting paper cash
 const START_SOL = 0;                // starting paper SOL
 const USD_PER_BUY = 25;             // buy size per level in USD
 
+// PACKETS (capacity / guard)
+// Buy & sell capacity are symmetrical to avoid unmatched positions.
+const BUY_PACKETS = 6;
+const SELL_PACKETS = 6;
+
 // render web service
 const PORT = process.env.PORT || 10000;
 
-// optional: set this in Render env vars to your public URL to do true external keepalive from inside too
+// optional: set this in Render env vars to your public URL
 // e.g. SERVICE_URL=https://solana-paper-grid-2.onrender.com
 const SERVICE_URL = process.env.SERVICE_URL || "";
 
@@ -43,7 +48,6 @@ try {
 // =====================
 // In-memory state (persisted)
 // =====================
-// level key format: "B:125.50" or "S:126.00"
 let state = {
   // anchor grid
   anchor: null,           // anchor price (fixed unless realignment)
@@ -63,12 +67,19 @@ let state = {
   lastAt: null,
   lastError: null,
 
+  // packets (capacity)
+  packets: {
+    buyCapacity: BUY_PACKETS,
+    sellCapacity: SELL_PACKETS,
+    note: "Capacity guard: blocks buys that would exceed sell capacity (unmatched positions).",
+  },
+
   // grid level state
   // levelStates[levelKey] = "WAIT" | "HIT" | "FILLED"
   levelStates: {},
 
   // positions per buy level
-  // positions[levelKey] = { qtySol, entryPrice }
+  // positions[levelKey] = { qtySol, entryPrice, openedAt }
   positions: {},
 
   // trade log
@@ -100,12 +111,16 @@ function loadState() {
     state.positions ||= {};
     state.trades ||= [];
     state.realign ||= { enabled: false };
+    state.packets ||= { buyCapacity: BUY_PACKETS, sellCapacity: SELL_PACKETS };
+
+    // Ensure capacities are present (in case old state.json didn't have them)
+    if (!Number.isFinite(state.packets.buyCapacity)) state.packets.buyCapacity = BUY_PACKETS;
+    if (!Number.isFinite(state.packets.sellCapacity)) state.packets.sellCapacity = SELL_PACKETS;
 
     console.log(
       `RESTORED_STATE anchor=${state.anchor ?? "n/a"} usdc=${state.usdc} sol=${state.sol} tick=${state.tick} trades=${state.trades.length}`
     );
   } catch (_) {
-    // first run
     console.log("NO_STATE_FOUND - starting fresh");
   }
 }
@@ -153,17 +168,68 @@ function buildLevels(anchor) {
   return { sells, buys };
 }
 
+// =====================
+// PACKET / POSITION STATS
+// =====================
+function computeUnrealizedPnl(currentPrice) {
+  let u = 0;
+  for (const k of Object.keys(state.positions)) {
+    const pos = state.positions[k];
+    u += (currentPrice - pos.entryPrice) * pos.qtySol;
+  }
+  return round2(u);
+}
+
+function computeStats(currentPrice = null) {
+  const trades = Array.isArray(state.trades) ? state.trades : [];
+
+  const buysFilled = trades.filter((t) => t.side === "BUY").length;
+  const sellsFilled = trades.filter((t) => t.side === "SELL").length;
+
+  const openPositions = Math.max(0, buysFilled - sellsFilled);
+
+  const buyCapacity = Number(state.packets?.buyCapacity || 0);
+  const sellCapacity = Number(state.packets?.sellCapacity || 0);
+
+  const unmatchedPositions = Math.max(0, openPositions - sellCapacity);
+
+  const unrealized = currentPrice != null ? computeUnrealizedPnl(currentPrice) : 0;
+  const totalPnl = round2(state.realizedPnl + unrealized);
+
+  return {
+    totalTrades: trades.length,
+    buysFilled,
+    sellsFilled,
+    openPositions,
+    unmatchedPositions,
+    buyCapacity,
+    sellCapacity,
+    pnl: {
+      realized: round2(state.realizedPnl),
+      unrealized,
+      total: totalPnl,
+    },
+  };
+}
+
+/**
+ * Guard rule:
+ * Allow placing a new BUY only if, AFTER the buy, we remain within sellCapacity.
+ * i.e. (openPositions + 1) <= sellCapacity
+ */
+function canPlaceAnotherBuy() {
+  const stats = computeStats(state.lastPrice);
+  const openAfterBuy = stats.openPositions + 1;
+  return openAfterBuy <= stats.sellCapacity;
+}
+
 function ensureGridInitialized(price) {
   if (state.anchor != null) return;
 
-  // Anchor is a rounded price so levels look clean.
-  // Example: step 0.50 -> anchor aligns to nearest 0.50
   const step = state.step;
   const anchor = round2(Math.round(price / step) * step);
-
   state.anchor = anchor;
 
-  // initialize level states
   const { sells, buys } = buildLevels(anchor);
 
   for (const p of sells) {
@@ -200,7 +266,6 @@ function markHits(currentPrice) {
 
   const { sells, buys } = buildLevels(state.anchor);
 
-  // if price crosses a waiting level, mark HIT (visual only)
   for (const p of sells) {
     const k = levelKey("S", p);
     if ((state.levelStates[k] || "WAIT") === "WAIT" && currentPrice >= p) {
@@ -226,12 +291,20 @@ function tryExecuteBuys(currentPrice) {
     const k = levelKey("B", p);
     const st = state.levelStates[k] || "WAIT";
 
-    // only buy once per level
     if ((st === "HIT" || st === "WAIT") && currentPrice <= p) {
       // already filled? skip
       if (state.positions[k]) {
         state.levelStates[k] = "FILLED";
         continue;
+      }
+
+      // PACKET GUARD: do not create unmatched open position
+      if (!canPlaceAnotherBuy()) {
+        state.levelStates[k] = "HIT";
+        state.lastError = `BUY_BLOCKED: sell packets exhausted (sellCapacity=${state.packets.sellCapacity}).`;
+        const s = computeStats(currentPrice);
+        console.log(`[GUARD] BUY blocked at L${fmt2(p)} | open=${s.openPositions} sellCap=${s.sellCapacity}`);
+        return; // stop buying further levels this tick
       }
 
       // affordability
@@ -243,7 +316,7 @@ function tryExecuteBuys(currentPrice) {
       state.usdc = round2(state.usdc - usd);
       state.sol = state.sol + qtySol;
 
-      state.positions[k] = { qtySol, entryPrice: currentPrice };
+      state.positions[k] = { qtySol, entryPrice: currentPrice, openedAt: new Date().toISOString() };
       state.levelStates[k] = "FILLED";
 
       const trade = {
@@ -258,7 +331,11 @@ function tryExecuteBuys(currentPrice) {
       state.trades.push(trade);
       clampTrades();
 
-      console.log(`BUY  level=${trade.level} price=${fmt2(trade.price)} qtySol=${trade.qtySol.toFixed(6)} usdc=${fmt2(state.usdc)} sol=${state.sol.toFixed(6)}`);
+      state.lastError = null;
+
+      console.log(
+        `BUY  level=${trade.level} price=${fmt2(trade.price)} qtySol=${trade.qtySol.toFixed(6)} usdc=${fmt2(state.usdc)} sol=${state.sol.toFixed(6)}`
+      );
     }
   }
 }
@@ -268,25 +345,17 @@ function tryExecuteSells(currentPrice) {
 
   const { sells } = buildLevels(state.anchor);
 
-  // For sells, we sell positions that correspond to buy levels.
-  // Simple pairing rule: sell the oldest open position first when price reaches any sell level.
-  // (We’ll improve pairing later if you want.)
-  // We execute at the first sell level reached.
-
-  // find if any sell level is reached
   const reached = sells.filter((p) => currentPrice >= p);
   if (reached.length === 0) return;
 
-  // choose the lowest reached sell level (closest above anchor) for display
   const sellLevel = Math.min(...reached);
   const sellKey = levelKey("S", sellLevel);
   if ((state.levelStates[sellKey] || "WAIT") === "WAIT") state.levelStates[sellKey] = "HIT";
 
-  // find oldest open position
   const openKeys = Object.keys(state.positions);
   if (openKeys.length === 0) return;
 
-  // oldest = earliest trade BUY that is still open
+  // oldest open position first
   const buyTrades = state.trades.filter((t) => t.side === "BUY");
   let posKey = null;
 
@@ -302,11 +371,9 @@ function tryExecuteSells(currentPrice) {
   const pos = state.positions[posKey];
   if (!pos) return;
 
-  // sell qty
   const qtySol = pos.qtySol;
 
   if (state.sol + 1e-12 < qtySol) {
-    // should not happen, but don’t explode
     state.lastError = "Not enough SOL to sell (paper mismatch)";
     return;
   }
@@ -333,26 +400,17 @@ function tryExecuteSells(currentPrice) {
   state.trades.push(trade);
   clampTrades();
 
-  // once we sell at this level, mark it FILLED for visual feedback
   state.levelStates[sellKey] = "FILLED";
+  state.lastError = null;
 
-  console.log(`SELL level=${trade.level} price=${fmt2(trade.price)} qtySol=${trade.qtySol.toFixed(6)} pnl=${fmt2(trade.pnl)} usdc=${fmt2(state.usdc)} sol=${state.sol.toFixed(6)}`);
-}
-
-function computeUnrealizedPnl(currentPrice) {
-  let u = 0;
-  for (const k of Object.keys(state.positions)) {
-    const pos = state.positions[k];
-    u += (currentPrice - pos.entryPrice) * pos.qtySol;
-  }
-  return round2(u);
+  console.log(
+    `SELL level=${trade.level} price=${fmt2(trade.price)} qtySol=${trade.qtySol.toFixed(6)} pnl=${fmt2(trade.pnl)} usdc=${fmt2(state.usdc)} sol=${state.sol.toFixed(6)}`
+  );
 }
 
 // =====================
 // Realignment placeholder
 // =====================
-// We are intentionally NOT moving the ladder yet.
-// But we can “suggest” realignment if price drifts too far from anchor.
 function maybeSuggestRealignment(currentPrice) {
   if (state.anchor == null) return;
 
@@ -374,7 +432,7 @@ function maybeSuggestRealignment(currentPrice) {
 }
 
 // =====================
-// Dashboard HTML (Layout B)
+// Dashboard HTML (Layout B) + Status Banner
 // =====================
 function htmlEscape(s) {
   return String(s)
@@ -388,8 +446,7 @@ function renderDashboard() {
   const anchor = state.anchor;
   const { sells, buys } = anchor != null ? buildLevels(anchor) : { sells: [], buys: [] };
 
-  const unreal = p != null ? computeUnrealizedPnl(p) : 0;
-  const totalPnl = round2(state.realizedPnl + unreal);
+  const stats = computeStats(p);
 
   // ladder rows: sells (top), NOW, buys (bottom)
   const rows = [];
@@ -408,18 +465,25 @@ function renderDashboard() {
     rows.push({ type: "BUY", price: bp, state: st, key: k });
   }
 
-  // last trades
   const lastTrades = state.trades.slice(-10).reverse();
 
   const css = `
     body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b0f14;color:#e8eef6}
     .wrap{max-width:560px;margin:0 auto;padding:14px}
-    .top{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
     .card{background:#121a23;border:1px solid #1f2a36;border-radius:14px;padding:12px}
-    .big{font-size:34px;font-weight:800;letter-spacing:.3px}
     .label{opacity:.75;font-size:12px}
     .val{font-size:18px;font-weight:700;margin-top:2px}
     .muted{opacity:.7;font-size:12px;margin-top:4px}
+
+    /* banner */
+    .banner{border-radius:16px;padding:12px 12px;margin-bottom:12px;border:1px solid #1f2a36;background:#0f141b}
+    .banner.ok{border-color:rgba(80,255,140,.28);background:rgba(80,255,140,.07)}
+    .banner.warn{border-color:rgba(255,80,80,.35);background:rgba(255,80,80,.10)}
+    .bigline{font-size:16px;font-weight:900;letter-spacing:.2px}
+    .pillrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+    .pill{font-size:12px;opacity:.9;border:1px solid #2b3442;border-radius:999px;padding:4px 10px;background:rgba(255,255,255,.04)}
+
+    .top{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
 
     .ladder{margin-top:10px}
     .row{display:flex;align-items:center;justify-content:space-between;border-radius:14px;padding:12px 14px;margin:8px 0;border:1px solid #1f2a36;background:#101720}
@@ -434,12 +498,32 @@ function renderDashboard() {
     .HIT{outline:2px solid rgba(255,255,255,.18)}
     .FILLED{box-shadow:0 0 0 2px rgba(255,255,255,.12) inset}
 
-    /* little badge */
     .badge{font-size:11px;opacity:.8;border:1px solid #2b3442;border-radius:999px;padding:2px 8px}
     .footer{margin-top:12px}
     .trade{display:flex;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:14px;border:1px solid #1f2a36;background:#0f141b;margin:8px 0}
     .trade .a{font-weight:900}
     .trade .b{opacity:.8}
+  `;
+
+  const bannerClass = stats.unmatchedPositions > 0 ? "banner warn" : "banner ok";
+  const bannerTitle = stats.unmatchedPositions > 0
+    ? `⚠ Unmatched positions: ${stats.unmatchedPositions}`
+    : `✅ Matched: sells can cover open positions`;
+
+  const bannerHtml = `
+    <div class="${bannerClass}">
+      <div class="bigline">${bannerTitle}</div>
+      <div class="muted" style="margin-top:6px">
+        Trades ${stats.totalTrades} • Buys ${stats.buysFilled} • Sells ${stats.sellsFilled}
+      </div>
+      <div class="pillrow">
+        <div class="pill">Open positions: <b>${stats.openPositions}</b></div>
+        <div class="pill">Sell packets: <b>${stats.sellCapacity}</b></div>
+        <div class="pill">Buy packets: <b>${stats.buyCapacity}</b></div>
+        <div class="pill">Guard: blocks BUY when open+1 &gt; sell packets</div>
+      </div>
+      ${state.lastError ? `<div class="muted" style="margin-top:8px">Last error: ${htmlEscape(state.lastError)}</div>` : ``}
+    </div>
   `;
 
   const ladderHtml = rows
@@ -497,12 +581,14 @@ function renderDashboard() {
     <head>
       <meta charset="utf-8"/>
       <meta name="viewport" content="width=device-width, initial-scale=1"/>
-      <meta http-equiv="refresh" content="5"> 
+      <meta http-equiv="refresh" content="5">
       <title>Grid Bot</title>
       <style>${css}</style>
     </head>
     <body>
       <div class="wrap">
+        ${bannerHtml}
+
         <div class="top">
           <div class="card">
             <div class="label">Balances</div>
@@ -511,9 +597,9 @@ function renderDashboard() {
           </div>
           <div class="card">
             <div class="label">P/L</div>
-            <div class="val">Realized ${fmt2(state.realizedPnl)}</div>
-            <div class="val">Unrealized ${fmt2(p != null ? computeUnrealizedPnl(p) : 0)}</div>
-            <div class="muted">Total ${fmt2(totalPnl)}</div>
+            <div class="val">Realized ${fmt2(stats.pnl.realized)}</div>
+            <div class="val">Unrealized ${fmt2(stats.pnl.unrealized)}</div>
+            <div class="muted">Total ${fmt2(stats.pnl.total)}</div>
           </div>
         </div>
 
@@ -540,7 +626,8 @@ function renderDashboard() {
 
 function getStatus() {
   const p = state.lastPrice;
-  const unreal = p != null ? computeUnrealizedPnl(p) : 0;
+  const stats = computeStats(p);
+
   return {
     now: new Date().toISOString(),
     lastPrice: state.lastPrice,
@@ -548,7 +635,14 @@ function getStatus() {
     anchor: state.anchor,
     step: state.step,
     balances: { usdc: state.usdc, sol: state.sol },
-    pnl: { realized: state.realizedPnl, unrealized: unreal, total: round2(state.realizedPnl + unreal) },
+    pnl: stats.pnl,
+    packets: {
+      buyCapacity: stats.buyCapacity,
+      sellCapacity: stats.sellCapacity,
+      openPositions: stats.openPositions,
+      unmatchedPositions: stats.unmatchedPositions,
+      guardAllowsBuy: canPlaceAnotherBuy(),
+    },
     openPositions: Object.keys(state.positions).length,
     tick: state.tick,
     hb: state.hb,
@@ -589,7 +683,7 @@ async function keepAlive() {
     // keep local loop busy
     await axios.get(`http://127.0.0.1:${PORT}/health`, { timeout: 5000 });
 
-    // optional external ping (still useful), but UptimeRobot is the real fix
+    // optional external ping
     if (SERVICE_URL) {
       await axios.get(`${SERVICE_URL}/health`, { timeout: 8000 });
     }
