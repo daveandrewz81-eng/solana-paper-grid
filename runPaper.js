@@ -1,7 +1,7 @@
-const axios = require("axios");
-const http = require("http");
-const dns = require("dns");
-const fs = require("fs");
+import axios from "axios";
+import http from "http";
+import dns from "dns";
+import fs from "fs";
 
 // =====================
 // CONFIG (easy tweaks)
